@@ -80,6 +80,7 @@ impl TaskViewSearcher {
             "reconcile_channel" => self.resolve_reconcile_channel(&task.payload),
             "download_video" => self.resolve_download_video(&task.payload),
             "fetch_thumbnail" => self.resolve_fetch_thumbnail(&task.payload),
+            "fetch_subtitles" => self.resolve_fetch_subtitles(&task.payload),
             "delete_video_file" => self.resolve_delete_video_file(&task.payload),
             "delete_playlist_files" => self.resolve_delete_playlist_files(&task.payload),
             "delete_channel_files" => self.resolve_delete_channel_files(&task.payload),
@@ -120,6 +121,11 @@ impl TaskViewSearcher {
         self.resolve_video(VideoRecordId::new(video_id)?)
     }
 
+    fn resolve_fetch_subtitles(&self, payload: &str) -> anyhow::Result<HashMap<String, String>> {
+        let (video_id, _output_dir) = Task::decode_fetch_subtitles_payload(payload)?;
+        self.resolve_video(VideoRecordId::new(video_id)?)
+    }
+
     /// The video's title, plus the name of the playlist or channel it
     /// belongs to.
     fn resolve_video(&self, video_id: VideoRecordId) -> anyhow::Result<HashMap<String, String>> {
@@ -148,9 +154,8 @@ impl TaskViewSearcher {
 
     fn resolve_delete_video_file(&self, payload: &str) -> anyhow::Result<HashMap<String, String>> {
         let mut view = HashMap::new();
-        let (filename, _thumbnail_filename, _output_dir) =
-            Task::decode_delete_video_file_payload(payload)?;
-        if let Some(filename) = filename {
+        let payload = Task::decode_delete_video_file_payload(payload)?;
+        if let Some(filename) = payload.filename {
             view.insert("filename".to_string(), filename);
         }
         Ok(view)

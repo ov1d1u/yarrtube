@@ -1,14 +1,14 @@
 use crate::domain::playlist::PlaylistPath;
 use crate::domain::services::{
-    MetadataGenerator, MetadataGeneratorApi, Relocation, ThumbnailFetcher, ThumbnailFetcherApi,
-    VideoRelocator, VideoRelocatorApi,
+    MetadataGenerator, MetadataGeneratorApi, Relocation, SubtitleFetcher, SubtitleFetcherApi,
+    ThumbnailFetcher, ThumbnailFetcherApi, VideoRelocator, VideoRelocatorApi,
 };
 use crate::domain::shared::Quality;
 use crate::domain::task::{ScheduledTask, Task};
 use crate::domain::video::VideoRecordId;
 use crate::domain::video::{
-    EpisodePaths, SHOW_NFO_FILENAME, SHOW_POSTER_FILENAME, Video, VideoStatus, is_episode_path,
-    is_season_folder, nfo_path_for, owning_entry, resolve_output_dir,
+    EpisodePaths, SHOW_NFO_FILENAME, SHOW_POSTER_FILENAME, SubtitleState, Video, VideoStatus,
+    is_episode_path, is_season_folder, nfo_path_for, owning_entry, resolve_output_dir,
 };
 use crate::domain::video_metadata::VideoMetadata;
 use crate::infrastructure::repositories::filesystem_video_file_repository::VideoFileRepository;
@@ -58,6 +58,7 @@ pub struct InternalVideoReconciler {
     video_metadata_repository: Arc<dyn VideoMetadataRepository>,
     task_repository: Arc<dyn TaskRepository>,
     video_file_repository: Arc<dyn VideoFileRepository>,
+    subtitle_fetcher: Arc<SubtitleFetcher>,
     thumbnail_fetcher: Arc<ThumbnailFetcher>,
     video_relocator: Arc<VideoRelocator>,
     clock: Arc<dyn Clock>,
@@ -72,6 +73,7 @@ impl InternalVideoReconciler {
         video_metadata_repository: Arc<dyn VideoMetadataRepository>,
         task_repository: Arc<dyn TaskRepository>,
         video_file_repository: Arc<dyn VideoFileRepository>,
+        subtitle_fetcher: Arc<SubtitleFetcher>,
         thumbnail_fetcher: Arc<ThumbnailFetcher>,
         video_relocator: Arc<VideoRelocator>,
         clock: Arc<dyn Clock>,
@@ -83,6 +85,7 @@ impl InternalVideoReconciler {
             video_metadata_repository,
             task_repository,
             video_file_repository,
+            subtitle_fetcher,
             thumbnail_fetcher,
             video_relocator,
             clock,
@@ -97,8 +100,8 @@ pub trait InternalVideoReconcilerApi: Send + Sync {
     /// flight): redownloads videos whose file is missing or not mp4, repairs
     /// missing metadata, recovers errored videos past their cooldown,
     /// reschedules stranded downloads, schedules missing thumbnails and
-    /// deletes orphaned files. `delta` tells it what the membership sync of
-    /// the same pass just added or renamed.
+    /// subtitles and deletes orphaned files. `delta` tells it what the
+    /// membership sync of the same pass just added or renamed.
     fn reconcile(&self, desired: &DesiredState, delta: &MembershipDelta) -> anyhow::Result<()>;
 }
 
@@ -121,6 +124,8 @@ impl InternalVideoReconcilerApi for InternalVideoReconciler {
             .collect();
         self.reschedule_stranded_downloads(desired, &actual, &handled)?;
         self.thumbnail_fetcher
+            .schedule_missing(&actual.videos, &handled, &actual.output_dir)?;
+        self.subtitle_fetcher
             .schedule_missing(&actual.videos, &handled, &actual.output_dir)?;
 
         self.delete_orphaned_files(&actual)
@@ -146,6 +151,7 @@ impl InternalVideoReconciler {
             .collect();
         let protected_entries = protected_entries(&videos);
         let numbered_episode_paths = numbered_episode_paths(&videos);
+        let subtitle_pending_paths = subtitle_pending_paths(&videos);
 
         Ok(ActualState {
             output_dir,
@@ -155,6 +161,7 @@ impl InternalVideoReconciler {
             broken_download_ids,
             protected_entries,
             numbered_episode_paths,
+            subtitle_pending_paths,
         })
     }
 
@@ -397,6 +404,10 @@ struct ActualState {
     /// or thumbnail fetch already moved into place under it is kept, even
     /// before the video records it.
     numbered_episode_paths: HashSet<String>,
+    /// The recorded media file's stem of every numbered video whose
+    /// subtitles are still Missing: a subtitle fetch may already have moved
+    /// its `<stem>.<lang>.srt` into place without recording it yet.
+    subtitle_pending_paths: HashSet<String>,
 }
 
 impl ActualState {
@@ -413,15 +424,20 @@ impl ActualState {
                     .to_string_lossy()
                     .as_ref(),
             )
+            || self.subtitle_pending_paths.iter().any(|stem| {
+                entry
+                    .strip_prefix(stem.as_str())
+                    .is_some_and(|rest| rest.starts_with('.'))
+            })
     }
 }
 
 /// Entries of the output folder orphan cleanup must keep: the show files,
-/// every `Downloaded` video's file and episode NFO, and every stored video's
+/// every `Downloaded` video's file and episode NFO, every stored video's
 /// thumbnail (a `Pending`/`InProgress` video may already have one
-/// pre-fetched, see the `video-thumbnails` capability). An episode file is
-/// kept by its path in its season folder, a legacy video by its top-level
-/// folder or flat file.
+/// pre-fetched, see the `video-thumbnails` capability) and every stored
+/// video's subtitle file. An episode file is kept by its path in its season
+/// folder, a legacy video by its top-level folder or flat file.
 fn protected_entries(videos: &[Video]) -> HashSet<String> {
     let downloaded_files: Vec<&str> = videos
         .iter()
@@ -431,6 +447,7 @@ fn protected_entries(videos: &[Video]) -> HashSet<String> {
     let thumbnails = videos
         .iter()
         .filter_map(|v| v.thumbnail_filename.as_deref());
+    let subtitles = videos.iter().filter_map(|v| v.subtitle_filename.as_deref());
     let episode_nfos = downloaded_files
         .iter()
         .filter(|filename| is_episode_path(filename))
@@ -439,6 +456,7 @@ fn protected_entries(videos: &[Video]) -> HashSet<String> {
         .iter()
         .copied()
         .chain(thumbnails)
+        .chain(subtitles)
         .map(|path| owning_entry(path).to_string());
     [SHOW_NFO_FILENAME, SHOW_POSTER_FILENAME]
         .map(str::to_string)
@@ -468,11 +486,25 @@ fn numbered_episode_paths(videos: &[Video]) -> HashSet<String> {
         .collect()
 }
 
+fn subtitle_pending_paths(videos: &[Video]) -> HashSet<String> {
+    videos
+        .iter()
+        .filter(|v| {
+            v.subtitle_state == SubtitleState::Missing
+                && v.episode_number.is_some()
+                && !v.is_in_legacy_layout()
+        })
+        .filter_map(|v| v.filename.as_deref())
+        .map(|filename| EpisodePaths::from_media(filename).stem())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::application::tasks::log_capture::captured_log_messages;
     use crate::domain::services::MetadataGenerator;
+    use crate::domain::services::SubtitleFetcher;
     use crate::domain::task::TaskStatus;
     use crate::domain::video::{EpisodeNumber, VideoId};
     use crate::domain::video_metadata::VideoMetadata;
@@ -480,10 +512,12 @@ mod tests {
     use crate::infrastructure::repositories::sqlite_task_repository::SqliteTaskRepository;
     use crate::infrastructure::repositories::sqlite_video_metadata_repository::SqliteVideoMetadataRepository;
     use crate::infrastructure::repositories::sqlite_video_repository::SqliteVideoRepository;
+    use crate::infrastructure::repositories::sqlite_video_transcript_repository::SqliteVideoTranscriptRepository;
     use crate::infrastructure::repositories::youtube_metadata_repository::{
         FakeYoutubeMetadataRepository, YoutubeMetadata,
     };
     use crate::infrastructure::repositories::youtube_video_downloader_repository::FakeVideoDownloaderRepository;
+    use crate::infrastructure::shared::domain_events::event_publisher::SqliteEventPublisher;
     use crate::infrastructure::shared::sqlite_connection::TestDatabase;
     use crate::infrastructure::shared::system_clock::FixedClock;
     use crate::infrastructure::shared::ytdlp::FetchedThumbnail;
@@ -1163,6 +1197,19 @@ mod tests {
             video_metadata_repository.clone(),
             task_repository.clone(),
             Arc::new(FakeVideoFileRepository::with_file_exists(true)),
+            Arc::new(SubtitleFetcher::new(
+                video_repository.clone(),
+                Arc::new(SqliteVideoTranscriptRepository::new(db.database())),
+                Arc::new(FakeVideoDownloaderRepository::default()),
+                Arc::new(FakeVideoFileRepository::default()),
+                task_repository.clone(),
+                Arc::new(SqliteEventPublisher::new(
+                    db.database(),
+                    Arc::new(FixedClock(fixed_timestamp())),
+                )),
+                Arc::new(FixedClock(fixed_timestamp())),
+                "/videos",
+            )),
             Arc::new(ThumbnailFetcher::new(
                 video_repository.clone(),
                 Arc::new(FakeVideoDownloaderRepository::default()),
@@ -1204,18 +1251,32 @@ mod tests {
         assert_eq!(video_repository.list().unwrap(), vec![video.clone()]);
         assert_eq!(
             task_repository.list_non_completed().unwrap(),
-            vec![pending_task(
-                1,
-                &Task::FetchThumbnail {
-                    video_id: video.id.as_str().to_string(),
-                    output_dir: videos_root
-                        .path()
-                        .join("my-playlist")
-                        .to_string_lossy()
-                        .to_string(),
-                },
-                fixed_timestamp(),
-            )]
+            vec![
+                pending_task(
+                    1,
+                    &Task::FetchThumbnail {
+                        video_id: video.id.as_str().to_string(),
+                        output_dir: videos_root
+                            .path()
+                            .join("my-playlist")
+                            .to_string_lossy()
+                            .to_string(),
+                    },
+                    fixed_timestamp(),
+                ),
+                pending_task(
+                    2,
+                    &Task::FetchSubtitles {
+                        video_id: video.id.as_str().to_string(),
+                        output_dir: videos_root
+                            .path()
+                            .join("my-playlist")
+                            .to_string_lossy()
+                            .to_string(),
+                    },
+                    fixed_timestamp(),
+                ),
+            ]
         );
     }
 
@@ -1248,6 +1309,19 @@ mod tests {
             video_metadata_repository.clone(),
             task_repository.clone(),
             Arc::new(FakeVideoFileRepository::with_file_exists(true)),
+            Arc::new(SubtitleFetcher::new(
+                video_repository.clone(),
+                Arc::new(SqliteVideoTranscriptRepository::new(db.database())),
+                Arc::new(FakeVideoDownloaderRepository::default()),
+                Arc::new(FakeVideoFileRepository::default()),
+                task_repository.clone(),
+                Arc::new(SqliteEventPublisher::new(
+                    db.database(),
+                    Arc::new(FixedClock(fixed_timestamp())),
+                )),
+                Arc::new(FixedClock(fixed_timestamp())),
+                "/videos",
+            )),
             Arc::new(ThumbnailFetcher::new(
                 video_repository.clone(),
                 Arc::new(FakeVideoDownloaderRepository::default()),
@@ -1292,18 +1366,32 @@ mod tests {
         assert_eq!(video_repository.list().unwrap(), vec![video.clone()]);
         assert_eq!(
             task_repository.list_non_completed().unwrap(),
-            vec![pending_task(
-                1,
-                &Task::FetchThumbnail {
-                    video_id: video.id.as_str().to_string(),
-                    output_dir: videos_root
-                        .path()
-                        .join("my-playlist")
-                        .to_string_lossy()
-                        .to_string(),
-                },
-                fixed_timestamp(),
-            )]
+            vec![
+                pending_task(
+                    1,
+                    &Task::FetchThumbnail {
+                        video_id: video.id.as_str().to_string(),
+                        output_dir: videos_root
+                            .path()
+                            .join("my-playlist")
+                            .to_string_lossy()
+                            .to_string(),
+                    },
+                    fixed_timestamp(),
+                ),
+                pending_task(
+                    2,
+                    &Task::FetchSubtitles {
+                        video_id: video.id.as_str().to_string(),
+                        output_dir: videos_root
+                            .path()
+                            .join("my-playlist")
+                            .to_string_lossy()
+                            .to_string(),
+                    },
+                    fixed_timestamp(),
+                ),
+            ]
         );
     }
 
@@ -1355,6 +1443,19 @@ mod tests {
             video_metadata_repository.clone(),
             task_repository.clone(),
             Arc::new(FakeVideoFileRepository::with_file_exists(true)),
+            Arc::new(SubtitleFetcher::new(
+                video_repository.clone(),
+                Arc::new(SqliteVideoTranscriptRepository::new(db.database())),
+                Arc::new(FakeVideoDownloaderRepository::default()),
+                Arc::new(FakeVideoFileRepository::default()),
+                task_repository.clone(),
+                Arc::new(SqliteEventPublisher::new(
+                    db.database(),
+                    Arc::new(FixedClock(fixed_timestamp())),
+                )),
+                Arc::new(FixedClock(fixed_timestamp())),
+                "/videos",
+            )),
             Arc::new(ThumbnailFetcher::new(
                 video_repository.clone(),
                 Arc::new(FakeVideoDownloaderRepository::default()),
@@ -1423,6 +1524,19 @@ mod tests {
             video_metadata_repository.clone(),
             task_repository.clone(),
             Arc::new(FakeVideoFileRepository::with_file_exists(false)),
+            Arc::new(SubtitleFetcher::new(
+                video_repository.clone(),
+                Arc::new(SqliteVideoTranscriptRepository::new(db.database())),
+                Arc::new(FakeVideoDownloaderRepository::default()),
+                Arc::new(FakeVideoFileRepository::default()),
+                task_repository.clone(),
+                Arc::new(SqliteEventPublisher::new(
+                    db.database(),
+                    Arc::new(FixedClock(fixed_timestamp())),
+                )),
+                Arc::new(FixedClock(fixed_timestamp())),
+                "/videos",
+            )),
             Arc::new(ThumbnailFetcher::new(
                 video_repository.clone(),
                 Arc::new(FakeVideoDownloaderRepository::default()),
@@ -1491,6 +1605,19 @@ mod tests {
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             task_repository.clone(),
             Arc::new(FakeVideoFileRepository::default()),
+            Arc::new(SubtitleFetcher::new(
+                video_repository.clone(),
+                Arc::new(SqliteVideoTranscriptRepository::new(db.database())),
+                video_downloader_repository.clone(),
+                Arc::new(FakeVideoFileRepository::default()),
+                task_repository.clone(),
+                Arc::new(SqliteEventPublisher::new(
+                    db.database(),
+                    Arc::new(FixedClock(fixed_timestamp())),
+                )),
+                Arc::new(FixedClock(fixed_timestamp())),
+                "/videos",
+            )),
             Arc::new(ThumbnailFetcher::new(
                 video_repository.clone(),
                 video_downloader_repository.clone(),
@@ -1556,6 +1683,19 @@ mod tests {
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             task_repository.clone(),
             Arc::new(FakeVideoFileRepository::default()),
+            Arc::new(SubtitleFetcher::new(
+                video_repository.clone(),
+                Arc::new(SqliteVideoTranscriptRepository::new(db.database())),
+                video_downloader_repository.clone(),
+                Arc::new(FakeVideoFileRepository::default()),
+                task_repository.clone(),
+                Arc::new(SqliteEventPublisher::new(
+                    db.database(),
+                    Arc::new(FixedClock(fixed_timestamp())),
+                )),
+                Arc::new(FixedClock(fixed_timestamp())),
+                "/videos",
+            )),
             Arc::new(ThumbnailFetcher::new(
                 video_repository.clone(),
                 video_downloader_repository.clone(),
@@ -1618,6 +1758,19 @@ mod tests {
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             task_repository.clone(),
             Arc::new(FakeVideoFileRepository::default()),
+            Arc::new(SubtitleFetcher::new(
+                video_repository.clone(),
+                Arc::new(SqliteVideoTranscriptRepository::new(db.database())),
+                video_downloader_repository.clone(),
+                Arc::new(FakeVideoFileRepository::default()),
+                task_repository.clone(),
+                Arc::new(SqliteEventPublisher::new(
+                    db.database(),
+                    Arc::new(FixedClock(fixed_timestamp())),
+                )),
+                Arc::new(FixedClock(fixed_timestamp())),
+                "/videos",
+            )),
             Arc::new(ThumbnailFetcher::new(
                 video_repository.clone(),
                 video_downloader_repository.clone(),
@@ -1724,6 +1877,19 @@ mod tests {
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             task_repository.clone(),
             Arc::new(FakeVideoFileRepository::with_file_exists(true)),
+            Arc::new(SubtitleFetcher::new(
+                video_repository.clone(),
+                Arc::new(SqliteVideoTranscriptRepository::new(db.database())),
+                video_downloader_repository.clone(),
+                Arc::new(FakeVideoFileRepository::default()),
+                task_repository.clone(),
+                Arc::new(SqliteEventPublisher::new(
+                    db.database(),
+                    Arc::new(FixedClock(fixed_timestamp())),
+                )),
+                Arc::new(FixedClock(fixed_timestamp())),
+                "/videos",
+            )),
             Arc::new(ThumbnailFetcher::new(
                 video_repository.clone(),
                 video_downloader_repository.clone(),
@@ -1777,6 +1943,19 @@ mod tests {
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             task_repository.clone(),
             Arc::new(FakeVideoFileRepository::with_listing(Vec::new())),
+            Arc::new(SubtitleFetcher::new(
+                video_repository.clone(),
+                Arc::new(SqliteVideoTranscriptRepository::new(db.database())),
+                video_downloader_repository.clone(),
+                Arc::new(FakeVideoFileRepository::default()),
+                task_repository.clone(),
+                Arc::new(SqliteEventPublisher::new(
+                    db.database(),
+                    Arc::new(FixedClock(fixed_timestamp())),
+                )),
+                Arc::new(FixedClock(fixed_timestamp())),
+                "/videos",
+            )),
             Arc::new(ThumbnailFetcher::new(
                 video_repository.clone(),
                 video_downloader_repository.clone(),
@@ -1867,6 +2046,19 @@ mod tests {
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             task_repository.clone(),
             video_file_repository,
+            Arc::new(SubtitleFetcher::new(
+                video_repository.clone(),
+                Arc::new(SqliteVideoTranscriptRepository::new(db.database())),
+                Arc::new(FakeVideoDownloaderRepository::default()),
+                Arc::new(FakeVideoFileRepository::default()),
+                task_repository.clone(),
+                Arc::new(SqliteEventPublisher::new(
+                    db.database(),
+                    Arc::new(FixedClock(fixed_timestamp())),
+                )),
+                Arc::new(FixedClock(fixed_timestamp())),
+                "/videos",
+            )),
             Arc::new(ThumbnailFetcher::new(
                 video_repository,
                 Arc::new(FakeVideoDownloaderRepository::default()),

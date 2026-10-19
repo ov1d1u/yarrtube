@@ -1,6 +1,6 @@
 use crate::domain::shared::Quality;
 use crate::domain::video::{
-    ChannelEpisodeNumber, EpisodeNumber, PlaybackPosition, Video, VideoStatus,
+    ChannelEpisodeNumber, EpisodeNumber, PlaybackPosition, SubtitleState, Video, VideoStatus,
 };
 use crate::domain::video::{VideoId, VideoRecordId};
 use crate::infrastructure::shared::sqlite_connection::Database;
@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
 use std::collections::HashMap;
 
-const VIDEO_COLUMNS: &str = "id, youtube_id, title, status, quality, filename, thumbnail_filename, duration_seconds, created_at, updated_at, watched_at, playback_position_seconds, synced_at, last_errored_at, last_played_at, season, episode";
+const VIDEO_COLUMNS: &str = "id, youtube_id, title, status, quality, filename, thumbnail_filename, duration_seconds, created_at, updated_at, watched_at, playback_position_seconds, synced_at, last_errored_at, last_played_at, season, episode, subtitle_state, subtitle_filename, subtitles_first_missing_at";
 
 /// A `videos` row as read, before its values are parsed into a `Video`.
 struct VideoRow {
@@ -30,6 +30,9 @@ struct VideoRow {
     last_played_at: Option<String>,
     season: Option<i32>,
     episode: Option<u32>,
+    subtitle_state: String,
+    subtitle_filename: Option<String>,
+    subtitles_first_missing_at: Option<String>,
 }
 
 pub trait VideoRepository: Send + Sync {
@@ -52,6 +55,11 @@ pub trait VideoRepository: Send + Sync {
         title: &str,
         now: DateTime<Utc>,
     ) -> anyhow::Result<()>;
+    /// Writes only `subtitle_state`, `subtitle_filename`,
+    /// `subtitles_first_missing_at` and `updated_at`,
+    /// leaving the download's fields untouched even if they changed since
+    /// the caller read the video.
+    fn update_subtitles(&self, video: &Video) -> anyhow::Result<()>;
     /// Writes only `thumbnail_filename` (and `updated_at`), leaving the
     /// download's fields untouched even if they changed since the caller
     /// read the video.
@@ -114,8 +122,8 @@ impl VideoRepository for SqliteVideoRepository {
     fn save(&self, video: &Video) -> anyhow::Result<()> {
         let conn = self.db.write()?;
         conn.execute(
-            "INSERT INTO videos (id, youtube_id, title, status, quality, filename, thumbnail_filename, duration_seconds, created_at, updated_at, watched_at, playback_position_seconds, synced_at, last_errored_at, last_played_at, season, episode)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+            "INSERT INTO videos (id, youtube_id, title, status, quality, filename, thumbnail_filename, duration_seconds, created_at, updated_at, watched_at, playback_position_seconds, synced_at, last_errored_at, last_played_at, season, episode, subtitle_state, subtitle_filename, subtitles_first_missing_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
              ON CONFLICT (id) DO UPDATE SET
                 youtube_id = excluded.youtube_id,
                 title = excluded.title,
@@ -132,7 +140,10 @@ impl VideoRepository for SqliteVideoRepository {
                 last_errored_at = excluded.last_errored_at,
                 last_played_at = excluded.last_played_at,
                 season = excluded.season,
-                episode = excluded.episode",
+                episode = excluded.episode,
+                subtitle_state = excluded.subtitle_state,
+                subtitle_filename = excluded.subtitle_filename,
+                subtitles_first_missing_at = excluded.subtitles_first_missing_at",
             params![
                 video.id.as_str(),
                 video.youtube_id.as_str(),
@@ -151,6 +162,9 @@ impl VideoRepository for SqliteVideoRepository {
                 video.last_played_at.map(|p| p.to_rfc3339()),
                 video.episode_number.map(|n| n.season()),
                 video.episode_number.map(|n| n.episode()),
+                video.subtitle_state.as_str(),
+                video.subtitle_filename,
+                video.subtitles_first_missing_at.map(|t| t.to_rfc3339()),
             ],
         )
         .inspect_err(|e| {
@@ -202,7 +216,7 @@ impl VideoRepository for SqliteVideoRepository {
     fn update(&self, video: &Video) -> anyhow::Result<()> {
         let conn = self.db.write()?;
         conn.execute(
-            "UPDATE videos SET youtube_id = ?2, title = ?3, status = ?4, quality = ?5, filename = ?6, thumbnail_filename = ?7, duration_seconds = ?8, updated_at = ?9, watched_at = ?10, playback_position_seconds = ?11, synced_at = ?12, last_errored_at = ?13, last_played_at = ?14, season = ?15, episode = ?16
+            "UPDATE videos SET youtube_id = ?2, title = ?3, status = ?4, quality = ?5, filename = ?6, thumbnail_filename = ?7, duration_seconds = ?8, updated_at = ?9, watched_at = ?10, playback_position_seconds = ?11, synced_at = ?12, last_errored_at = ?13, last_played_at = ?14, season = ?15, episode = ?16, subtitle_state = ?17, subtitle_filename = ?18, subtitles_first_missing_at = ?19
              WHERE id = ?1",
             params![
                 video.id.as_str(),
@@ -221,6 +235,9 @@ impl VideoRepository for SqliteVideoRepository {
                 video.last_played_at.map(|p| p.to_rfc3339()),
                 video.episode_number.map(|n| n.season()),
                 video.episode_number.map(|n| n.episode()),
+                video.subtitle_state.as_str(),
+                video.subtitle_filename,
+                video.subtitles_first_missing_at.map(|t| t.to_rfc3339()),
             ],
         )
         .inspect_err(|e| {
@@ -245,6 +262,25 @@ impl VideoRepository for SqliteVideoRepository {
             |e| tracing::error!(video_id = %id, error = %e, "failed to update video title"),
         )
         .context("failed to update video title")?;
+        Ok(())
+    }
+
+    fn update_subtitles(&self, video: &Video) -> anyhow::Result<()> {
+        let conn = self.db.write()?;
+        conn.execute(
+            "UPDATE videos SET subtitle_state = ?2, subtitle_filename = ?3, subtitles_first_missing_at = ?4, updated_at = ?5 WHERE id = ?1",
+            params![
+                video.id.as_str(),
+                video.subtitle_state.as_str(),
+                video.subtitle_filename,
+                video.subtitles_first_missing_at.map(|t| t.to_rfc3339()),
+                video.updated_at.to_rfc3339(),
+            ],
+        )
+        .inspect_err(|e| {
+            tracing::error!(video_id = %video.id, error = %e, "failed to update video subtitles")
+        })
+        .context("failed to update video subtitles")?;
         Ok(())
     }
 
@@ -431,6 +467,9 @@ impl SqliteVideoRepository {
             last_played_at: row.get(14)?,
             season: row.get(15)?,
             episode: row.get(16)?,
+            subtitle_state: row.get(17)?,
+            subtitle_filename: row.get(18)?,
+            subtitles_first_missing_at: row.get(19)?,
         })
     }
 
@@ -464,6 +503,12 @@ impl SqliteVideoRepository {
                 .map(|p| Self::parse_timestamp(&p, "last_played_at"))
                 .transpose()?,
             episode_number: Self::decode_episode_number(row.season, row.episode)?,
+            subtitle_state: SubtitleState::parse(&row.subtitle_state)?,
+            subtitle_filename: row.subtitle_filename,
+            subtitles_first_missing_at: row
+                .subtitles_first_missing_at
+                .map(|t| Self::parse_timestamp(&t, "subtitles_first_missing_at"))
+                .transpose()?,
         })
     }
 
@@ -755,6 +800,48 @@ mod tests {
                 ..original
             })
         );
+    }
+
+    #[test]
+    fn it_should_update_only_the_subtitle_columns() {
+        let repo = repo();
+        let now = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
+        let later = DateTime::<Utc>::from_timestamp(100, 0).unwrap();
+        let original = video("First", now).start_download(now);
+        repo.save(&original).unwrap();
+
+        repo.update_subtitles(
+            &Video {
+                title: "Renamed".to_string(),
+                status: VideoStatus::Errored,
+                ..original.clone()
+            }
+            .mark_subtitles_unavailable(later),
+        )
+        .unwrap();
+
+        assert_eq!(
+            repo.find(&original.id).unwrap(),
+            Some(original.mark_subtitles_unavailable(later))
+        );
+    }
+
+    #[test]
+    fn it_should_round_trip_the_first_check_without_captions() {
+        let repo = repo();
+        let now = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
+        let checked_at = DateTime::<Utc>::from_timestamp(100, 0).unwrap();
+        let original = video("First", now);
+        repo.save(&original).unwrap();
+        let checked = Video {
+            subtitles_first_missing_at: Some(checked_at),
+            updated_at: checked_at,
+            ..original.clone()
+        };
+
+        repo.update_subtitles(&checked).unwrap();
+
+        assert_eq!(repo.find(&original.id).unwrap(), Some(checked));
     }
 
     #[test]

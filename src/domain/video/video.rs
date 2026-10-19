@@ -1,5 +1,6 @@
 use super::episode_number::EpisodeNumber;
 use super::playback_position::PlaybackPosition;
+use super::subtitle_state::SubtitleState;
 use super::video_duration::VideoDuration;
 use super::video_id::VideoId;
 use super::video_output_entry::is_episode_path;
@@ -47,6 +48,12 @@ pub struct Video {
     /// The video's episode number within its show, assigned once by the
     /// first thumbnail fetch, download or relocation that places a file.
     pub episode_number: Option<EpisodeNumber>,
+    pub subtitle_state: SubtitleState,
+    /// The episode's subtitle file, recorded once its subtitles are fetched.
+    pub subtitle_filename: Option<String>,
+    /// When a conclusive subtitle fetch first found no selectable track:
+    /// starts the 7-day window before the subtitles are given up on.
+    pub subtitles_first_missing_at: Option<DateTime<Utc>>,
 }
 
 const WATCHED_THRESHOLD: f64 = 0.9;
@@ -71,6 +78,9 @@ impl Video {
             last_errored_at: None,
             last_played_at: None,
             episode_number: None,
+            subtitle_state: SubtitleState::Missing,
+            subtitle_filename: None,
+            subtitles_first_missing_at: None,
         }
     }
 
@@ -147,10 +157,12 @@ impl Video {
     }
 
     /// Resets a video back to `Pending`, clearing its recorded filename,
-    /// thumbnail filename, and quality, used by filesystem reconciliation
-    /// both when a `Downloaded` video's recorded file is missing from disk
-    /// and when an `Errored` video is given another chance, in each case
-    /// followed by scheduling a fresh download.
+    /// thumbnail filename, quality and subtitles (back to `Missing` with no
+    /// first check without captions, so the redownload refetches them),
+    /// used by filesystem reconciliation both when a `Downloaded` video's
+    /// recorded file is missing from disk and when an `Errored` video is
+    /// given another chance, in each case followed by scheduling a fresh
+    /// download.
     pub fn reset_for_redownload(self, now: DateTime<Utc>) -> Self {
         Self {
             status: VideoStatus::Pending,
@@ -160,6 +172,9 @@ impl Video {
             duration_seconds: None,
             updated_at: now,
             synced_at: None,
+            subtitle_state: SubtitleState::Missing,
+            subtitle_filename: None,
+            subtitles_first_missing_at: None,
             ..self
         }
     }
@@ -274,6 +289,51 @@ impl Video {
     /// nor an `Errored` one, whose recovery redownload writes its own.
     pub fn is_thumbnail_fetchable(&self) -> bool {
         !matches!(self.status, VideoStatus::Excluded | VideoStatus::Errored)
+    }
+
+    /// Whether a subtitle fetch is worth attempting: Downloaded, numbered,
+    /// in its season folder (a legacy-layout file has no episode path to
+    /// place the subtitles next to) and its subtitles still Missing.
+    pub fn is_subtitle_fetchable(&self) -> bool {
+        self.is_downloaded()
+            && self.episode_number.is_some()
+            && !self.is_in_legacy_layout()
+            && self.subtitle_state == SubtitleState::Missing
+    }
+
+    /// Records the fetched subtitle file: subtitle state Fetched. Touches
+    /// only the subtitle fields and `updated_at`, stored through
+    /// `VideoRepository::update_subtitles` only.
+    pub fn with_subtitles(self, subtitle_filename: impl Into<String>, now: DateTime<Utc>) -> Self {
+        Self {
+            subtitle_state: SubtitleState::Fetched,
+            subtitle_filename: Some(subtitle_filename.into()),
+            updated_at: now,
+            ..self
+        }
+    }
+
+    /// The video has no original-language captions: a terminal subtitle
+    /// state.
+    pub fn mark_subtitles_unavailable(self, now: DateTime<Utc>) -> Self {
+        Self {
+            subtitle_state: SubtitleState::Unavailable,
+            updated_at: now,
+            ..self
+        }
+    }
+
+    /// Records `now` as the first check without captions, unless one is
+    /// already recorded.
+    pub fn mark_subtitles_first_missing(self, now: DateTime<Utc>) -> Self {
+        match self.subtitles_first_missing_at {
+            Some(_) => self,
+            None => Self {
+                subtitles_first_missing_at: Some(now),
+                updated_at: now,
+                ..self
+            },
+        }
     }
 
     /// Records the episode number assigned to this video.
@@ -532,6 +592,104 @@ mod tests {
     }
 
     #[test]
+    fn it_should_record_its_fetched_subtitles() {
+        let now = DateTime::<Utc>::from_timestamp(100, 0).unwrap();
+        let video = video();
+
+        let fetched = video
+            .clone()
+            .with_subtitles("Season 1/S01E003 - My Video.en.srt", now);
+
+        assert_eq!(
+            fetched,
+            Video {
+                subtitle_state: SubtitleState::Fetched,
+                subtitle_filename: Some("Season 1/S01E003 - My Video.en.srt".to_string()),
+                updated_at: now,
+                ..video
+            }
+        );
+    }
+
+    #[test]
+    fn it_should_mark_its_subtitles_unavailable() {
+        let now = DateTime::<Utc>::from_timestamp(100, 0).unwrap();
+        let video = video();
+
+        let unavailable = video.clone().mark_subtitles_unavailable(now);
+
+        assert_eq!(
+            unavailable,
+            Video {
+                subtitle_state: SubtitleState::Unavailable,
+                updated_at: now,
+                ..video
+            }
+        );
+    }
+
+    #[test]
+    fn it_should_clear_its_subtitles_when_reset_for_redownload() {
+        let now = DateTime::<Utc>::from_timestamp(100, 0).unwrap();
+        let later = DateTime::<Utc>::from_timestamp(200, 0).unwrap();
+        let fetched = video()
+            .mark_downloaded(
+                Quality::High,
+                "Season 1/S01E003 - My Video.mp4",
+                None,
+                None,
+                now,
+            )
+            .with_subtitles("Season 1/S01E003 - My Video.en.srt", now);
+
+        let reset = fetched.clone().reset_for_redownload(later);
+
+        assert_eq!(
+            reset,
+            Video {
+                status: VideoStatus::Pending,
+                quality: None,
+                filename: None,
+                subtitle_state: SubtitleState::Missing,
+                subtitle_filename: None,
+                updated_at: later,
+                synced_at: None,
+                ..fetched
+            }
+        );
+    }
+
+    #[test]
+    fn it_should_clear_the_first_check_without_captions_when_reset_for_redownload() {
+        let now = DateTime::<Utc>::from_timestamp(100, 0).unwrap();
+        let later = DateTime::<Utc>::from_timestamp(200, 0).unwrap();
+        let checked = video()
+            .mark_downloaded(
+                Quality::High,
+                "Season 1/S01E003 - My Video.mp4",
+                None,
+                None,
+                now,
+            )
+            .mark_subtitles_first_missing(now);
+
+        let reset = checked.clone().reset_for_redownload(later);
+
+        assert_eq!(
+            reset,
+            Video {
+                status: VideoStatus::Pending,
+                quality: None,
+                filename: None,
+                subtitles_first_missing_at: None,
+                updated_at: later,
+                synced_at: None,
+                ..checked
+            }
+        );
+    }
+
+    #[test]
     fn it_should_keep_when_it_last_errored_when_reset_for_redownload() {
         let errored_at = DateTime::<Utc>::from_timestamp(100, 0).unwrap();
         let later = DateTime::<Utc>::from_timestamp(200, 0).unwrap();
@@ -624,5 +782,29 @@ mod tests {
             [pending, retrying, in_progress].map(|v| v.is_due_for_recovery(later)),
             [false, false, false]
         );
+    }
+
+    #[test]
+    fn it_should_not_be_subtitle_fetchable_if_in_the_legacy_layout() {
+        let now = DateTime::<Utc>::from_timestamp(100, 0).unwrap();
+        let number = EpisodeNumber::from_columns(1, 3).unwrap();
+        let downloaded_at = |filename: &str| {
+            video().with_episode_number(number, now).mark_downloaded(
+                Quality::High,
+                filename,
+                None,
+                None,
+                now,
+            )
+        };
+
+        let fetchable = [
+            "Season 1/S01E003 - My Video.mp4",
+            "My Video/My Video.mp4",
+            "My Video.mp4",
+        ]
+        .map(|filename| downloaded_at(filename).is_subtitle_fetchable());
+
+        assert_eq!(fetchable, [true, false, false]);
     }
 }

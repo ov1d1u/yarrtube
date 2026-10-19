@@ -49,9 +49,9 @@ flowchart TB
 
 For more information on the architectural decisions and conventions used in Yarrtube you can take a look at the [Rust Architect skill](../.claude/skills/rust-architect/SKILL.md).
 
-## Example: track a channel and download its videos
+## Example: track a channel and download its videos and subtitles
 
-To illustrate this domain-driven flow we can take a look at what happens when a user adds a channel subscription and all the videos end up downloaded:
+To illustrate this domain-driven flow we can take a look at what happens when a user adds a channel subscription and all the videos end up downloaded, with their subtitles:
 
 1. `POST /api/channels` saves the channel and publishes `ChannelCreated` domain event.
 2. The `ReconcileOnChannelCreated` subscriber runs asynchronously, polling the domain events table (which acts like a queue), and runs the first channel sync.
@@ -72,11 +72,30 @@ To illustrate this domain-driven flow we can take a look at what happens when a 
    episode number from the publish time `yt-dlp` reports, and move the
    result into the show's season folder (see below). The thumbnail usually
    arrives first, so the UI can show it while the video is still downloading.
-   A finished download publishes `VideoDownloaded`, which asks Plex to scan
-   the show folder when the scan trigger is configured.
-5. Every interval, the `ReconcileChannel` task runs the sync again and schedules
-   the next one. New uploads repeat steps 3–4. The sync also schedules a
-   `FetchThumbnail` for any video still missing its thumbnail.
+   A finished download publishes `VideoDownloaded`, which has two
+   subscribers:
+   - `FetchSubtitlesOnVideoDownloaded` schedules a `FetchSubtitles` task.
+   - `ScanPlexFolderOnVideoDownloaded` asks Plex to scan the show folder,
+     when the scan trigger is configured.
+5. The `TaskExecutor` runs `FetchSubtitles` in its own lane, one at a time,
+   so a large backfill never floods YouTube or delays downloads. It probes
+   the video's caption tracks, writes the original-language track as
+   `<episode>.<lang>.srt` (`<lang>` being the base language code, e.g. `es`
+   for `es-US`) and stores its plain-text transcript (`video_transcripts`),
+   then publishes `VideoSubtitlesFetched`, whose
+   `ScanPlexFolderOnVideoSubtitlesFetched` subscriber asks Plex to scan the
+   show folder again so the subtitle shows up. A video with no
+   original-language captions records its first such check
+   (`subtitles_first_missing_at`) and becomes `UNAVAILABLE` once both its
+   publish date and that first check are 7 days old; any failure, or a probe
+   where yt-dlp warned (it can withhold caption tracks silently), leaves it
+   `MISSING`.
+6. Every interval, the `ReconcileChannel` task runs the sync again and schedules
+   the next one. New uploads repeat steps 3–5. The sync also schedules a
+   `FetchThumbnail` for any video still missing its thumbnail, and a
+   `FetchSubtitles` for any downloaded video whose subtitles are still
+   `MISSING`: that backfills an upgraded library and retries videos whose
+   captions weren't available yet.
 
 ```mermaid
 sequenceDiagram
@@ -88,6 +107,7 @@ sequenceDiagram
     participant Tasks as tasks table
     participant Executor as TaskExecutor
     participant YT as YouTube / yt-dlp
+    participant Plex
 
     User->>API: POST /api/channels
     API->>Events: save channel, publish ChannelCreated
@@ -104,6 +124,13 @@ sequenceDiagram
     Events->>Tasks: schedule FetchThumbnail + DownloadVideo per video
     Executor->>Tasks: poll and run tasks
     Executor->>YT: yt-dlp fetches thumbnail, then downloads video
+    Executor->>Events: publish VideoDownloaded
+
+    Events->>Tasks: schedule FetchSubtitles (FetchSubtitlesOnVideoDownloaded)
+    Events->>Plex: scan show folder (if configured)
+    Executor->>YT: yt-dlp probes captions, downloads original-language .srt
+    Executor->>Events: save transcript, publish VideoSubtitlesFetched
+    Events->>Plex: scan show folder again (if configured)
 
     Note over Reconciler,Executor: One interval later, ReconcileChannel<br/>re-syncs and schedules the next run.
 ```
@@ -117,7 +144,7 @@ Each tracked playlist or channel is a TV show under its storage path:
 ├── tvshow.nfo                                  ShowFileWriter, on every sync
 ├── poster.jpg                                  channels only (avatar copy)
 └── Season <year>/                              Season 1/ for a playlist
-    └── S<year>E<MMDDii> - <title>.{mp4,jpg,nfo}  S01E<nnn> - <title>.* for a playlist
+    └── S<year>E<MMDDii> - <title>.{mp4,jpg,nfo,<lang>.srt}  S01E<nnn> - <title>.* for a playlist
 ```
 
 - **Episode number** (`ChannelEpisodeNumber` / `PlaylistEpisodeNumber`) is

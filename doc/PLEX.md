@@ -4,7 +4,7 @@
 
 Every tracked playlist and channel shows up in Plex (and Kodi or Jellyfin)
 as a **TV show**: one tile per playlist/channel, episode thumbnails,
-Continue Watching, On Deck and "play next episode".
+subtitles, Continue Watching, On Deck and "play next episode".
 
 ```
 channels/Some Channel/
@@ -27,6 +27,23 @@ playlists/Some Playlist/
   at the end.
 
 Episode numbers never change, so Plex keeps your watch progress.
+
+Right after an episode is downloaded, yarrtube also fetches its captions
+in the video's original language (uploaded ones, else YouTube's
+auto-generated ones; never translations) and saves them next to it as
+`S2026E031501 - Title.en.srt`, which Plex picks up as an external subtitle.
+The file is named by the base language code (`.es.srt` for `es-US`
+captions), which Plex recognises. Plex lists them in the subtitle menu;
+whether it turns them on by itself depends on each Plex user's subtitle
+settings (_Account → Languages_). Videos without captions in their language
+get none, but only after a week of retries: a video is given up on once it
+was published at least 7 days ago and its first check without captions was
+at least 7 days ago, so captions YouTube hasn't generated yet, and old videos
+of a playlist added today, are retried on later syncs. A check where yt-dlp
+printed a warning (it can silently withhold captions, e.g. when YouTube
+asks for a token) doesn't count, and is retried too. After upgrading, the first sync of each playlist and channel
+queues a subtitle fetch for every episode already downloaded; they run one
+at a time in the background.
 
 Only step 1 is required. Step 2 is optional and makes new episodes show up
 in Plex right after they download.
@@ -60,7 +77,8 @@ episodes on its own, and the scan trigger below just makes it immediate.
 ## 2. Scan trigger (optional)
 
 With the scan trigger on, yarrtube asks Plex to scan a show as soon as one
-of its videos finishes downloading. You need:
+of its videos finishes downloading, and again once that video's subtitle
+file is written. You need:
 
 - A Plex token (`X-Plex-Token`) to authenticate yarrtube's requests.
 - The path at which the Plex server sees yarrtube's videos root.

@@ -1,4 +1,5 @@
 use crate::domain::shared::Quality;
+use crate::domain::video_transcript::{CaptionSource, CaptionTrack, CaptionTracks};
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use std::io;
@@ -164,12 +165,7 @@ pub fn download_video(
         .stderr(Stdio::piped());
     let output = match run(
         &mut cmd,
-        || {
-            format!(
-                "`yt-dlp` was not found at {}. Install yt-dlp there or run update-ytdlp before running yarrtube.",
-                ytdlp_path.display()
-            )
-        },
+        || not_found_message(ytdlp_path),
         |e| format!("Failed to run yt-dlp for {video_url}: {e}"),
     )? {
         RunOutcome::Success(output) => output,
@@ -276,12 +272,7 @@ pub fn fetch_thumbnail(
     .stderr(Stdio::piped());
     let output = match run(
         &mut cmd,
-        || {
-            format!(
-                "`yt-dlp` was not found at {}. Install yt-dlp there or run update-ytdlp before running yarrtube.",
-                ytdlp_path.display()
-            )
-        },
+        || not_found_message(ytdlp_path),
         |e| format!("Failed to run yt-dlp thumbnail fetch for {video_url}: {e}"),
     )? {
         RunOutcome::Success(output) => output,
@@ -317,6 +308,160 @@ pub fn fetch_thumbnail(
     })
 }
 
+/// Where `probe_captions` writes the video's info JSON in the staging dir.
+const INFO_JSON_FILENAME: &str = "info.json";
+
+/// The fields of yt-dlp's info JSON a caption probe reads. Track lists are
+/// keyed by yt-dlp's `--sub-langs` key, sorted; absent or `null` when the
+/// video has none.
+#[derive(serde::Deserialize)]
+struct CaptionInfo {
+    language: Option<String>,
+    timestamp: Option<i64>,
+    upload_date: Option<String>,
+    subtitles: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+    automatic_captions: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+}
+
+/// A caption probe's result: the tracks yt-dlp's info JSON lists, the
+/// video's publish time when reported, and the info JSON itself, written to
+/// the staging dir.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptionProbe {
+    pub tracks: CaptionTracks,
+    pub published_at: Option<DateTime<Utc>>,
+    /// Reused by `fetch_subtitles` (`--load-info-json`): one extraction per
+    /// video, fewer YouTube requests.
+    pub info_json: PathBuf,
+    /// yt-dlp's stderr `WARNING:` lines: any warning makes a probe without
+    /// a selectable track inconclusive (yt-dlp withholds tracks silently,
+    /// e.g. without a PO token).
+    pub warnings: Vec<String>,
+}
+
+/// A caption-only download's result: the staged `.srt` and its contents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchedSubtitles {
+    pub path: PathBuf,
+    pub srt: String,
+}
+
+/// `-J --skip-download --write-subs` without `--no-warnings`: subtitle
+/// warnings only appear when subtitles are requested, and `-J` writes no
+/// files. Err on any failure (clean or systemic), so the caller leaves the
+/// video Missing.
+pub fn probe_captions(
+    ytdlp_path: &Path,
+    video_url: &str,
+    staging_dir: &Path,
+) -> Result<CaptionProbe> {
+    ensure_output_dir(staging_dir)?;
+    let mut cmd = Command::new(ytdlp_path);
+    cmd.args(["-J", "--skip-download", "--write-subs"])
+        .arg(video_url)
+        .current_dir(staging_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = match run(
+        &mut cmd,
+        || not_found_message(ytdlp_path),
+        |e| format!("Failed to run yt-dlp caption probe for {video_url}: {e}"),
+    )? {
+        RunOutcome::Success(output) => output,
+        RunOutcome::CleanFailure { stderr_raw } => {
+            let reason = failure_reason(&stderr_raw);
+            return Err(anyhow!(
+                "yt-dlp failed to probe captions for {video_url}: {reason}"
+            ));
+        }
+    };
+
+    let info_json = staging_dir.join(INFO_JSON_FILENAME);
+    std::fs::write(&info_json, &output.stdout)
+        .map_err(|e| anyhow!("Failed to write the info JSON to {info_json:?}: {e}"))?;
+    let info: CaptionInfo = serde_json::from_slice(&output.stdout)
+        .map_err(|e| anyhow!("failed to parse yt-dlp info JSON for {video_url}: {e}"))?;
+    Ok(CaptionProbe {
+        published_at: info
+            .timestamp
+            .and_then(|seconds| DateTime::from_timestamp(seconds, 0))
+            .or_else(|| info.upload_date.as_deref().and_then(parse_upload_date)),
+        tracks: CaptionTracks {
+            original_language: info.language,
+            manual: info.subtitles.unwrap_or_default().into_keys().collect(),
+            automatic: info
+                .automatic_captions
+                .unwrap_or_default()
+                .into_keys()
+                .collect(),
+        },
+        info_json,
+        warnings: warning_lines(&String::from_utf8_lossy(&output.stderr)),
+    })
+}
+
+/// `--load-info-json --skip-download --write-subs|--write-auto-subs
+/// --sub-langs <key> --sub-format vtt --convert-subs srt`.
+pub fn fetch_subtitles(
+    ytdlp_path: &Path,
+    probe: &CaptionProbe,
+    track: &CaptionTrack,
+    staging_dir: &Path,
+) -> Result<FetchedSubtitles> {
+    let write_flag = match track.source {
+        CaptionSource::Manual => "--write-subs",
+        CaptionSource::Automatic => "--write-auto-subs",
+    };
+    let mut cmd = Command::new(ytdlp_path);
+    cmd.arg("--load-info-json")
+        .arg(&probe.info_json)
+        .args([
+            "-o",
+            STAGED_OUTPUT_TEMPLATE,
+            "--skip-download",
+            write_flag,
+            "--sub-langs",
+            &track.key,
+            "--sub-format",
+            "vtt",
+            "--convert-subs",
+            "srt",
+            "--quiet",
+            "--no-warnings",
+        ])
+        .current_dir(staging_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    match run(
+        &mut cmd,
+        || not_found_message(ytdlp_path),
+        |e| {
+            format!(
+                "Failed to run yt-dlp subtitle download for {}: {e}",
+                track.key
+            )
+        },
+    )? {
+        RunOutcome::Success(_) => {}
+        RunOutcome::CleanFailure { stderr_raw } => {
+            let reason = failure_reason(&stderr_raw);
+            return Err(anyhow!(
+                "yt-dlp failed to download the {} subtitles: {reason}",
+                track.key
+            ));
+        }
+    }
+    let path = staged_srt(staging_dir, &track.key)?.ok_or_else(|| {
+        anyhow!(
+            "yt-dlp wrote no SubRip file for the {} subtitles",
+            track.key
+        )
+    })?;
+    let srt = std::fs::read_to_string(&path)
+        .map_err(|e| anyhow!("Failed to read the staged subtitles {path:?}: {e}"))?;
+    Ok(FetchedSubtitles { path, srt })
+}
+
 /// Runs a simulate-only `yt-dlp` probe for `video_url`, forcing the
 /// alternate player clients, to reveal the *precise* reason a download
 /// failed — `yt-dlp`'s default clients collapse many distinct permanent
@@ -345,10 +490,7 @@ pub fn diagnose(ytdlp_path: &Path, video_url: &str) -> Result<Option<String>> {
     let output = match output_retrying_busy(&mut cmd) {
         Ok(output) => output,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            return Err(anyhow!(
-                "`yt-dlp` was not found at {}. Install yt-dlp there or run update-ytdlp before running yarrtube.",
-                ytdlp_path.display()
-            ));
+            return Err(anyhow!(not_found_message(ytdlp_path)));
         }
         Err(e) => {
             return Err(anyhow!(
@@ -439,17 +581,13 @@ pub fn list_channel_videos(
     let output = match output_retrying_busy(&mut cmd) {
         Ok(output) => output,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            return Err(anyhow!(
-                "`yt-dlp` was not found at {}. Install yt-dlp there or run update-ytdlp before running yarrtube.",
-                ytdlp_path.display()
-            ));
+            return Err(anyhow!(not_found_message(ytdlp_path)));
         }
         Err(e) => return Err(anyhow!("Failed to run yt-dlp for {channel_url}: {e}")),
     };
 
     if !output.status.success() {
-        let reason = reason_excluding_warnings(&String::from_utf8_lossy(&output.stderr))
-            .unwrap_or_else(|| "no error reported".to_string());
+        let reason = failure_reason(&String::from_utf8_lossy(&output.stderr));
         return Err(anyhow!(
             "yt-dlp failed to list channel videos for {channel_url}: {reason}"
         ));
@@ -512,6 +650,17 @@ fn reason_excluding_warnings(stderr: &str) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
+fn not_found_message(ytdlp_path: &Path) -> String {
+    format!(
+        "`yt-dlp` was not found at {}. Install yt-dlp there or run update-ytdlp before running yarrtube.",
+        ytdlp_path.display()
+    )
+}
+
+fn failure_reason(stderr: &str) -> String {
+    reason_excluding_warnings(stderr).unwrap_or_else(|| "no error reported".to_string())
+}
+
 /// Detects YouTube's SABR-only streaming experiment in a `yt-dlp` run's
 /// stderr. `yt-dlp` announces it on a `WARNING:` line mentioning SABR (the
 /// better formats skipped as "missing a URL"); keying on the case-insensitive
@@ -551,6 +700,16 @@ fn run(
     Ok(RunOutcome::Success(output))
 }
 
+/// Every `WARNING:` line of `stderr`, without its indentation.
+fn warning_lines(stderr: &str) -> Vec<String> {
+    stderr
+        .lines()
+        .map(str::trim_start)
+        .filter(|line| line.starts_with("WARNING:"))
+        .map(str::to_string)
+        .collect()
+}
+
 fn ensure_output_dir(output_path: &Path) -> Result<()> {
     std::fs::create_dir_all(output_path)
         .map_err(|e| anyhow!("Failed to create output directory {output_path:?}: {e}"))
@@ -560,6 +719,22 @@ fn ensure_output_dir(output_path: &Path) -> Result<()> {
 /// next to the staged media, when it is there.
 fn staged_thumbnail(media_path: &Path) -> Option<PathBuf> {
     Some(media_path.with_extension("jpg")).filter(|thumbnail| thumbnail.is_file())
+}
+
+/// The `<id>.<key>.srt` `--convert-subs srt` left in `staging_dir` for the
+/// track requested by its `--sub-langs` key, when it is there: yt-dlp names
+/// a subtitle file after the output template's stem plus the key, and any
+/// other track's file left in the staging dir is ignored.
+fn staged_srt(staging_dir: &Path, key: &str) -> Result<Option<PathBuf>> {
+    let suffix = format!(".{key}.srt");
+    let entries = std::fs::read_dir(staging_dir)
+        .map_err(|e| anyhow!("Failed to list the staging dir {staging_dir:?}: {e}"))?;
+    Ok(entries
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().ends_with(&suffix))
+        }))
 }
 
 /// The printed line `back` lines before the last one, when printed.
@@ -739,6 +914,36 @@ pub(crate) mod test_support {
             }
         }
 
+        /// A fake `yt-dlp` that exits 0 after writing `contents` to
+        /// `file_name` in the directory it's invoked in, copied from a file
+        /// so it's immune to shell quoting — stands in for `yt-dlp` writing
+        /// a converted subtitle file.
+        pub(crate) fn writing_file(file_name: &str, contents: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+
+            let bin_dir = unique_temp_dir("fake-ytdlp-bin");
+            let script_path = bin_dir.join("yt-dlp");
+            let captured_args_path = bin_dir.join("captured-args");
+            let contents_path = bin_dir.join("file-content");
+            fs::write(&contents_path, contents).unwrap();
+            fs::write(
+                &script_path,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\ncp \"{}\" \"{file_name}\"\nexit 0\n",
+                    captured_args_path.display(),
+                    contents_path.display()
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).unwrap();
+
+            Self {
+                _bin_dir: bin_dir,
+                path: script_path,
+                captured_args_path,
+            }
+        }
+
         /// The arguments the fake `yt-dlp` was last invoked with, one per line.
         pub(crate) fn captured_args(&self) -> Vec<String> {
             fs::read_to_string(&self.captured_args_path)
@@ -753,6 +958,31 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::video_transcript::CaptionLanguage;
+
+    /// Trimmed `yt-dlp -J` output of real videos, captured to pin down how
+    /// it reports caption tracks and languages.
+    const UPLOADED_CAPTIONS_INFO_JSON: &str =
+        include_str!("ytdlp_fixtures/uploaded_captions.info.json");
+    const AUTO_ONLY_SPANISH_INFO_JSON: &str =
+        include_str!("ytdlp_fixtures/auto_only_spanish.info.json");
+
+    fn a_probe_in(staging_dir: &Path) -> CaptionProbe {
+        CaptionProbe {
+            tracks: CaptionTracks::default(),
+            published_at: None,
+            info_json: staging_dir.join("info.json"),
+            warnings: vec![],
+        }
+    }
+
+    fn caption_track(key: &str, language: &str, source: CaptionSource) -> CaptionTrack {
+        CaptionTrack {
+            key: key.to_string(),
+            language: CaptionLanguage::new(language).unwrap(),
+            source,
+        }
+    }
 
     fn unwrap_succeeded(attempt: DownloadAttempt) -> DownloadedVideo {
         match attempt {
@@ -1046,6 +1276,276 @@ mod tests {
             fake.captured_args()
                 .windows(2)
                 .any(|pair| pair == ["-o", "%(id)s.%(ext)s"])
+        );
+        std::fs::remove_dir_all(&staging_dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn it_should_parse_caption_tracks_and_language_from_the_info_json() {
+        let staging_dir = test_support::unique_temp_dir("ytdlp-captions-staging");
+        let fake = test_support::FakeYtDlp::with_stdout(AUTO_ONLY_SPANISH_INFO_JSON);
+
+        let result = probe_captions(&fake.path, "https://example.com/video", &staging_dir);
+
+        assert_eq!(
+            result.unwrap(),
+            CaptionProbe {
+                tracks: CaptionTracks {
+                    original_language: Some("es-US".to_string()),
+                    manual: vec![],
+                    automatic: ["de", "en", "en-orig", "es", "es-orig", "fr", "ja"]
+                        .map(str::to_string)
+                        .to_vec(),
+                },
+                published_at: Some(DateTime::from_timestamp(1792267205, 0).unwrap()),
+                info_json: staging_dir.join("info.json"),
+                warnings: vec![],
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(staging_dir.join("info.json")).unwrap(),
+            AUTO_ONLY_SPANISH_INFO_JSON
+        );
+        std::fs::remove_dir_all(&staging_dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn it_should_parse_the_publish_timestamp_from_the_info_json() {
+        let staging_dir = test_support::unique_temp_dir("ytdlp-captions-staging");
+        let with_timestamp = test_support::FakeYtDlp::with_stdout(UPLOADED_CAPTIONS_INFO_JSON);
+        let with_upload_date_only = test_support::FakeYtDlp::with_stdout(
+            &UPLOADED_CAPTIONS_INFO_JSON
+                .replace("\"timestamp\": 1256453853", "\"timestamp\": null"),
+        );
+
+        let published_at = [&with_timestamp, &with_upload_date_only].map(|fake| {
+            probe_captions(&fake.path, "https://example.com/video", &staging_dir)
+                .unwrap()
+                .published_at
+        });
+
+        assert_eq!(
+            published_at,
+            [
+                Some(DateTime::from_timestamp(1256453853, 0).unwrap()),
+                Some(
+                    DateTime::parse_from_rfc3339("2009-10-25T00:00:00Z")
+                        .unwrap()
+                        .to_utc()
+                ),
+            ]
+        );
+        std::fs::remove_dir_all(&staging_dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn it_should_request_subtitles_and_keep_warnings_when_probing() {
+        let staging_dir = test_support::unique_temp_dir("ytdlp-captions-staging");
+        let fake = test_support::FakeYtDlp::with_stdout(UPLOADED_CAPTIONS_INFO_JSON);
+
+        probe_captions(&fake.path, "https://example.com/video", &staging_dir).unwrap();
+
+        assert_eq!(
+            fake.captured_args(),
+            [
+                "-J",
+                "--skip-download",
+                "--write-subs",
+                "https://example.com/video"
+            ]
+            .map(str::to_string)
+        );
+        std::fs::remove_dir_all(&staging_dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn it_should_collect_the_warnings_of_a_probe() {
+        let staging_dir = test_support::unique_temp_dir("ytdlp-captions-staging");
+        let ytdlp = fake_ytdlp_writing_stdout_and_stderr(
+            "ytdlp-captions-warning",
+            UPLOADED_CAPTIONS_INFO_JSON,
+            "[youtube] yt1: Downloading webpage\nWARNING: [youtube] yt1: Some subtitles may be missing\n",
+        );
+
+        let result = probe_captions(&ytdlp, "https://example.com/video", &staging_dir);
+
+        assert_eq!(
+            result.unwrap().warnings,
+            vec!["WARNING: [youtube] yt1: Some subtitles may be missing".to_string()]
+        );
+        std::fs::remove_dir_all(&staging_dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn it_should_fail_the_probe_on_a_clean_failed_exit() {
+        let staging_dir = test_support::unique_temp_dir("ytdlp-captions-staging");
+        let ytdlp = fake_ytdlp_writing_stderr(
+            "ytdlp-captions-failing",
+            "ERROR: [youtube] yt1: HTTP Error 429: Too Many Requests",
+            1,
+        );
+
+        let result = probe_captions(&ytdlp, "https://example.com/video", &staging_dir);
+
+        assert_eq!(
+            result.map_err(|e| e.to_string()),
+            Err("yt-dlp failed to probe captions for https://example.com/video: ERROR: [youtube] yt1: HTTP Error 429: Too Many Requests".to_string())
+        );
+        std::fs::remove_dir_all(&staging_dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn it_should_pass_manual_subtitle_flags_for_a_manual_track() {
+        let staging_dir = test_support::unique_temp_dir("ytdlp-subtitles-staging");
+        let fake = test_support::FakeYtDlp::with_downloaded_files("", &["yt1.en.srt"]);
+        let probe = a_probe_in(&staging_dir);
+
+        fetch_subtitles(
+            &fake.path,
+            &probe,
+            &caption_track("en", "en", CaptionSource::Manual),
+            &staging_dir,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fake.captured_args(),
+            [
+                "--load-info-json",
+                &staging_dir.join("info.json").to_string_lossy(),
+                "-o",
+                "%(id)s.%(ext)s",
+                "--skip-download",
+                "--write-subs",
+                "--sub-langs",
+                "en",
+                "--sub-format",
+                "vtt",
+                "--convert-subs",
+                "srt",
+                "--quiet",
+                "--no-warnings",
+            ]
+            .map(str::to_string)
+        );
+        std::fs::remove_dir_all(&staging_dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn it_should_pass_auto_subtitle_flags_for_an_automatic_track() {
+        let staging_dir = test_support::unique_temp_dir("ytdlp-subtitles-staging");
+        let fake = test_support::FakeYtDlp::with_downloaded_files("", &["yt1.en-orig.srt"]);
+        let probe = a_probe_in(&staging_dir);
+
+        fetch_subtitles(
+            &fake.path,
+            &probe,
+            &caption_track("en-orig", "en", CaptionSource::Automatic),
+            &staging_dir,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fake.captured_args(),
+            [
+                "--load-info-json",
+                &staging_dir.join("info.json").to_string_lossy(),
+                "-o",
+                "%(id)s.%(ext)s",
+                "--skip-download",
+                "--write-auto-subs",
+                "--sub-langs",
+                "en-orig",
+                "--sub-format",
+                "vtt",
+                "--convert-subs",
+                "srt",
+                "--quiet",
+                "--no-warnings",
+            ]
+            .map(str::to_string)
+        );
+        std::fs::remove_dir_all(&staging_dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn it_should_return_the_written_srt_and_its_contents() {
+        let staging_dir = test_support::unique_temp_dir("ytdlp-subtitles-staging");
+        std::fs::write(staging_dir.join("info.json"), "{}").unwrap();
+        let srt = "1\n00:00:00,000 --> 00:00:02,000\nHello there\n";
+        let fake = test_support::FakeYtDlp::writing_file("yt1.en.srt", srt);
+        let probe = a_probe_in(&staging_dir);
+
+        let result = fetch_subtitles(
+            &fake.path,
+            &probe,
+            &caption_track("en", "en", CaptionSource::Manual),
+            &staging_dir,
+        );
+
+        assert_eq!(
+            result.unwrap(),
+            FetchedSubtitles {
+                path: staging_dir.join("yt1.en.srt"),
+                srt: srt.to_string(),
+            }
+        );
+        std::fs::remove_dir_all(&staging_dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn it_should_return_the_srt_of_the_requested_track_if_another_is_staged() {
+        let staging_dir = test_support::unique_temp_dir("ytdlp-subtitles-staging");
+        std::fs::write(staging_dir.join("info.json"), "{}").unwrap();
+        std::fs::write(staging_dir.join("yt1.es.srt"), "stale").unwrap();
+        let srt = "1\n00:00:00,000 --> 00:00:02,000\nHello there\n";
+        let fake = test_support::FakeYtDlp::writing_file("yt1.en.srt", srt);
+        let probe = a_probe_in(&staging_dir);
+
+        let result = fetch_subtitles(
+            &fake.path,
+            &probe,
+            &caption_track("en", "en", CaptionSource::Manual),
+            &staging_dir,
+        );
+
+        assert_eq!(
+            result.unwrap(),
+            FetchedSubtitles {
+                path: staging_dir.join("yt1.en.srt"),
+                srt: srt.to_string(),
+            }
+        );
+        std::fs::remove_dir_all(&staging_dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn it_should_fail_when_no_srt_was_written() {
+        let staging_dir = test_support::unique_temp_dir("ytdlp-subtitles-staging");
+        std::fs::write(staging_dir.join("info.json"), "{}").unwrap();
+        let fake = test_support::FakeYtDlp::with_exit_code(0);
+        let probe = a_probe_in(&staging_dir);
+
+        let result = fetch_subtitles(
+            &fake.path,
+            &probe,
+            &caption_track("en", "en", CaptionSource::Manual),
+            &staging_dir,
+        );
+
+        assert_eq!(
+            result.map_err(|e| e.to_string()),
+            Err("yt-dlp wrote no SubRip file for the en subtitles".to_string())
         );
         std::fs::remove_dir_all(&staging_dir).unwrap();
     }
@@ -1448,6 +1948,46 @@ mod tests {
     }
 
     #[test]
+    fn it_should_fail_with_an_install_hint_if_no_binary_exists_for_a_diagnostic_probe() {
+        use test_support::unique_temp_dir;
+
+        let dir = unique_temp_dir("ytdlp-diagnose-missing-binary-message");
+        let missing_path = dir.join("does-not-exist");
+
+        let result = diagnose(&missing_path, "https://example.com/video");
+
+        assert_eq!(
+            result.map(|_| ()).map_err(|e| e.to_string()),
+            Err(format!(
+                "`yt-dlp` was not found at {}. Install yt-dlp there or run update-ytdlp before running yarrtube.",
+                missing_path.display()
+            ))
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn it_should_fail_to_run_if_the_binary_is_not_executable_for_a_diagnostic_probe() {
+        use test_support::unique_temp_dir;
+
+        let dir = unique_temp_dir("ytdlp-diagnose-non-executable-binary");
+        let non_executable_path = dir.join("yt-dlp");
+        std::fs::write(&non_executable_path, "#!/bin/sh\nexit 0\n").unwrap();
+
+        let result = diagnose(&non_executable_path, "https://example.com/video");
+
+        assert_eq!(
+            result.map(|_| ()).map_err(|e| e.to_string()),
+            Err(
+                "Failed to run yt-dlp diagnostic probe for https://example.com/video: Permission denied (os error 13)"
+                    .to_string()
+            )
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     #[cfg(unix)]
     fn it_should_return_the_printed_thumbnail_filename_on_success() {
         use test_support::{FakeYtDlp, unique_temp_dir};
@@ -1688,6 +2228,54 @@ mod tests {
 
         assert!(result.is_err());
         std::fs::remove_dir_all(&output_dir).unwrap();
+    }
+
+    #[test]
+    fn it_should_fail_with_an_install_hint_if_no_binary_exists_for_channel_video_listing() {
+        use test_support::unique_temp_dir;
+
+        let dir = unique_temp_dir("ytdlp-channel-videos-missing-binary-message");
+        let missing_path = dir.join("does-not-exist");
+
+        let result = list_channel_videos(
+            &missing_path,
+            "https://www.youtube.com/@somechannel/videos",
+            10,
+        );
+
+        assert_eq!(
+            result.map(|_| ()).map_err(|e| e.to_string()),
+            Err(format!(
+                "`yt-dlp` was not found at {}. Install yt-dlp there or run update-ytdlp before running yarrtube.",
+                missing_path.display()
+            ))
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn it_should_fail_to_run_if_the_binary_is_not_executable_for_channel_video_listing() {
+        use test_support::unique_temp_dir;
+
+        let dir = unique_temp_dir("ytdlp-channel-videos-non-executable-binary");
+        let non_executable_path = dir.join("yt-dlp");
+        std::fs::write(&non_executable_path, "#!/bin/sh\nexit 0\n").unwrap();
+
+        let result = list_channel_videos(
+            &non_executable_path,
+            "https://www.youtube.com/@somechannel/videos",
+            10,
+        );
+
+        assert_eq!(
+            result.map(|_| ()).map_err(|e| e.to_string()),
+            Err(
+                "Failed to run yt-dlp for https://www.youtube.com/@somechannel/videos: Permission denied (os error 13)"
+                    .to_string()
+            )
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Regression test for the JSON-line parsing format (see design.md):

@@ -1,7 +1,9 @@
 use crate::domain::shared::Quality;
+use crate::domain::video_transcript::CaptionTrack;
 use crate::infrastructure::shared::ytdlp;
 pub use crate::infrastructure::shared::ytdlp::{
-    DownloadAttempt, DownloadedVideo, FetchedThumbnail, ThumbnailFetch,
+    CaptionProbe, DownloadAttempt, DownloadedVideo, FetchedSubtitles, FetchedThumbnail,
+    ThumbnailFetch,
 };
 use std::path::{Path, PathBuf};
 
@@ -43,6 +45,20 @@ pub trait VideoDownloaderRepository: Send + Sync {
     /// "Video unavailable"), and `Err` only for a systemic problem. The probe
     /// never downloads — it only diagnoses.
     fn diagnose(&self, video_url: &str) -> anyhow::Result<Option<String>>;
+
+    /// Reads the video's caption tracks, original language and publish time
+    /// into `staging_dir`, downloading nothing. `Err` on any failure, clean
+    /// or systemic.
+    fn probe_captions(&self, video_url: &str, staging_dir: &Path) -> anyhow::Result<CaptionProbe>;
+
+    /// Downloads only `track` of the probed video into `staging_dir`, as
+    /// SubRip. `Err` on any failure, including no `.srt` written.
+    fn fetch_subtitles(
+        &self,
+        probe: &CaptionProbe,
+        track: &CaptionTrack,
+        staging_dir: &Path,
+    ) -> anyhow::Result<FetchedSubtitles>;
 }
 
 /// Invokes `yt-dlp` at `ytdlp_path`, the same configured path `update-ytdlp`
@@ -78,6 +94,19 @@ impl VideoDownloaderRepository for YtDlpVideoDownloaderRepository {
     fn diagnose(&self, video_url: &str) -> anyhow::Result<Option<String>> {
         ytdlp::diagnose(&self.ytdlp_path, video_url)
     }
+
+    fn probe_captions(&self, video_url: &str, staging_dir: &Path) -> anyhow::Result<CaptionProbe> {
+        ytdlp::probe_captions(&self.ytdlp_path, video_url, staging_dir)
+    }
+
+    fn fetch_subtitles(
+        &self,
+        probe: &CaptionProbe,
+        track: &CaptionTrack,
+        staging_dir: &Path,
+    ) -> anyhow::Result<FetchedSubtitles> {
+        ytdlp::fetch_subtitles(&self.ytdlp_path, probe, track, staging_dir)
+    }
 }
 
 /// What a `FakeVideoDownloaderRepository`'s `diagnose` yields: a determined
@@ -104,6 +133,15 @@ pub struct FakeVideoDownloaderRepository {
     /// mid-download.
     #[allow(clippy::type_complexity)]
     pub(crate) on_download: Option<Box<dyn Fn() + Send + Sync>>,
+    /// Runs while `fetch_subtitles` is in flight, e.g. to delete the video
+    /// mid-fetch.
+    #[allow(clippy::type_complexity)]
+    pub(crate) on_fetch_subtitles: Option<Box<dyn Fn() + Send + Sync>>,
+    pub(crate) caption_probe: std::sync::Mutex<Option<anyhow::Result<CaptionProbe>>>,
+    pub(crate) subtitles_result: std::sync::Mutex<Option<anyhow::Result<FetchedSubtitles>>>,
+    /// How many times the downloader was contacted for captions, probe or
+    /// download.
+    pub(crate) caption_calls: std::sync::Mutex<usize>,
 }
 
 #[cfg(test)]
@@ -193,10 +231,35 @@ impl FakeVideoDownloaderRepository {
         }
     }
 
+    /// Configures what `probe_captions` returns.
+    pub fn with_caption_probe(self, probe: anyhow::Result<CaptionProbe>) -> Self {
+        Self {
+            caption_probe: std::sync::Mutex::new(Some(probe)),
+            ..self
+        }
+    }
+
+    /// Configures what `fetch_subtitles` returns, its path relative to the
+    /// staging dir.
+    pub fn with_subtitles_result(self, result: anyhow::Result<FetchedSubtitles>) -> Self {
+        Self {
+            subtitles_result: std::sync::Mutex::new(Some(result)),
+            ..self
+        }
+    }
+
     /// Runs `hook` while `download` is in flight.
     pub fn with_on_download(self, hook: impl Fn() + Send + Sync + 'static) -> Self {
         Self {
             on_download: Some(Box::new(hook)),
+            ..self
+        }
+    }
+
+    /// Runs `hook` while `fetch_subtitles` is in flight.
+    pub fn with_on_fetch_subtitles(self, hook: impl Fn() + Send + Sync + 'static) -> Self {
+        Self {
+            on_fetch_subtitles: Some(Box::new(hook)),
             ..self
         }
     }
@@ -229,6 +292,10 @@ impl FakeVideoDownloaderRepository {
             thumbnail_result: Default::default(),
             thumbnail_calls: Default::default(),
             on_download: None,
+            on_fetch_subtitles: None,
+            caption_probe: Default::default(),
+            subtitles_result: Default::default(),
+            caption_calls: Default::default(),
         }
     }
 }
@@ -287,6 +354,40 @@ impl VideoDownloaderRepository for FakeVideoDownloaderRepository {
             DiagnoseOutcome::Reason(reason) => Ok(reason),
             DiagnoseOutcome::Error => Err(anyhow::anyhow!("fake diagnose error")),
         }
+    }
+
+    fn probe_captions(
+        &self,
+        _video_url: &str,
+        _staging_dir: &Path,
+    ) -> anyhow::Result<CaptionProbe> {
+        *self.caption_calls.lock().unwrap() += 1;
+        self.caption_probe
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or_else(|| Err(anyhow::anyhow!("no fake caption probe configured")))
+    }
+
+    fn fetch_subtitles(
+        &self,
+        _probe: &CaptionProbe,
+        _track: &CaptionTrack,
+        staging_dir: &Path,
+    ) -> anyhow::Result<FetchedSubtitles> {
+        *self.caption_calls.lock().unwrap() += 1;
+        if let Some(hook) = &self.on_fetch_subtitles {
+            hook();
+        }
+        self.subtitles_result
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or_else(|| Err(anyhow::anyhow!("no fake subtitles configured")))
+            .map(|fetched| FetchedSubtitles {
+                path: staging_dir.join(&fetched.path),
+                ..fetched
+            })
     }
 }
 
