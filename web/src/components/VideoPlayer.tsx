@@ -1,9 +1,11 @@
-import { videoMediaUrl } from '@/api/client'
+import { type VideoSourceRef, videoMediaUrl, videoSubtitlesUrl } from '@/api/client'
 import type { Video } from '@/api/types'
+import { languageName } from '@/lib/languageName'
 import { cn } from '@/lib/utils'
 
 interface VideoPlayerProps {
   basePath: string
+  source: VideoSourceRef
   video: Video | null
   autoplay: boolean
   onVideoElement: (element: HTMLVideoElement | null) => void
@@ -17,7 +19,13 @@ interface VideoPlayerProps {
  * (cancelling the page gutter) and sticks right under the header while the
  * page scrolls.
  */
-export function VideoPlayer({ basePath, video, autoplay, onVideoElement }: VideoPlayerProps) {
+export function VideoPlayer({
+  basePath,
+  source,
+  video,
+  autoplay,
+  onVideoElement,
+}: VideoPlayerProps) {
   // The downloaded file to play, or null while the video can't play yet.
   const filename = video?.status === 'DOWNLOADED' ? video.filename : null
 
@@ -30,7 +38,6 @@ export function VideoPlayer({ basePath, video, autoplay, onVideoElement }: Video
       )}
     >
       {video && filename ? (
-        // eslint-disable-next-line jsx-a11y/media-has-caption
         <video
           ref={onVideoElement}
           controls
@@ -40,7 +47,19 @@ export function VideoPlayer({ basePath, video, autoplay, onVideoElement }: Video
           poster={
             video.thumbnail_filename ? videoMediaUrl(basePath, video.thumbnail_filename) : undefined
           }
-        />
+        >
+          {video.subtitle_language && (
+            // Not `default`: captions stay off until turned on from the player's own controls.
+            // Keyed per video so a new track starts off; the <video> itself isn't remounted.
+            <track
+              key={video.id}
+              kind="subtitles"
+              src={videoSubtitlesUrl(source, video.id)}
+              srcLang={video.subtitle_language}
+              label={languageName(video.subtitle_language)}
+            />
+          )}
+        </video>
       ) : (
         <p className="text-sm text-muted-foreground">
           {video ? 'This video has not been downloaded yet.' : 'Select a video to play it.'}

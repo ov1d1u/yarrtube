@@ -44,6 +44,10 @@ pub trait VideoFileRepository: Send + Sync {
     /// Removes `dir` if it is empty; a non-empty or missing `dir` is left
     /// alone, not an error.
     fn remove_if_empty(&self, dir: &Path) -> anyhow::Result<()>;
+
+    /// Reads the UTF-8 content of the file at `output_dir.join(filename)`.
+    /// A missing file is `Ok(None)`, not an error.
+    fn read_to_string(&self, output_dir: &Path, filename: &str) -> anyhow::Result<Option<String>>;
 }
 
 pub struct FilesystemVideoFileRepository;
@@ -137,6 +141,18 @@ impl VideoFileRepository for FilesystemVideoFileRepository {
             .inspect_err(|e| tracing::error!(dir = ?dir, error = %e, "failed to remove directory"))
             .map_err(|e| anyhow::anyhow!("failed to remove directory {dir:?}: {e}"))
     }
+
+    fn read_to_string(&self, output_dir: &Path, filename: &str) -> anyhow::Result<Option<String>> {
+        let path = output_dir.join(filename);
+        match std::fs::read_to_string(&path) {
+            Ok(content) => Ok(Some(content)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => {
+                tracing::error!(path = ?path, error = %e, "failed to read file");
+                Err(anyhow::anyhow!("failed to read {path:?}: {e}"))
+            }
+        }
+    }
 }
 
 /// The entries directly in `output_dir`, excluding yt-dlp's in-progress
@@ -201,6 +217,8 @@ pub struct FakeVideoFileRepository {
     pub(crate) on_move: Option<Box<dyn Fn(&Path, &Path) + Send + Sync>>,
     /// Sources whose `move_file` fails, as a permission error would.
     pub(crate) failing_moves: Vec<std::path::PathBuf>,
+    /// Files `read_to_string` finds, keyed by their full path.
+    pub(crate) files: Vec<(std::path::PathBuf, String)>,
 }
 
 #[cfg(test)]
@@ -240,6 +258,14 @@ impl FakeVideoFileRepository {
     pub fn with_failing_move(self, from: impl Into<std::path::PathBuf>) -> Self {
         Self {
             failing_moves: [self.failing_moves, vec![from.into()]].concat(),
+            ..self
+        }
+    }
+
+    /// The same fake, holding a file at `path` with `content`.
+    pub fn with_file(self, path: impl Into<std::path::PathBuf>, content: &str) -> Self {
+        Self {
+            files: [self.files, vec![(path.into(), content.to_string())]].concat(),
             ..self
         }
     }
@@ -313,6 +339,15 @@ impl VideoFileRepository for FakeVideoFileRepository {
             .unwrap()
             .push(dir.to_path_buf());
         Ok(())
+    }
+
+    fn read_to_string(&self, output_dir: &Path, filename: &str) -> anyhow::Result<Option<String>> {
+        let path = output_dir.join(filename);
+        Ok(self
+            .files
+            .iter()
+            .find(|(file, _)| *file == path)
+            .map(|(_, content)| content.clone()))
     }
 }
 
@@ -592,6 +627,50 @@ mod tests {
         let exists = FilesystemVideoFileRepository.file_exists(&dir, "Nonexistent.mp4");
 
         assert!(!exists);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn it_should_read_a_files_content() {
+        let dir = unique_temp_dir("video-file-repository-read");
+        std::fs::create_dir_all(dir.join("Season 1")).unwrap();
+        std::fs::write(dir.join("Season 1/My Video.en.srt"), "1\nHello there\n").unwrap();
+
+        let content = FilesystemVideoFileRepository
+            .read_to_string(&dir, "Season 1/My Video.en.srt")
+            .unwrap();
+
+        assert_eq!(content, Some("1\nHello there\n".to_string()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn it_should_read_none_when_the_file_is_missing() {
+        let dir = unique_temp_dir("video-file-repository-read-missing");
+
+        let content =
+            FilesystemVideoFileRepository.read_to_string(&dir, "Season 1/My Video.en.srt");
+
+        assert_eq!(content.map_err(|e| e.to_string()), Ok(None));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn it_should_fail_to_read_a_file_that_is_not_utf8() {
+        let dir = unique_temp_dir("video-file-repository-read-not-utf8");
+        std::fs::create_dir_all(dir.join("Season 1")).unwrap();
+        let path = dir.join("Season 1/My Video.en.srt");
+        std::fs::write(&path, [0xff, 0xfe, 0xfd]).unwrap();
+
+        let content =
+            FilesystemVideoFileRepository.read_to_string(&dir, "Season 1/My Video.en.srt");
+
+        assert_eq!(
+            content.map_err(|e| e.to_string()),
+            Err(format!(
+                "failed to read {path:?}: stream did not contain valid UTF-8"
+            ))
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -6,15 +6,23 @@ use super::validation::{MISSING_POSITION, MISSING_WAS_WATCHED, required};
 use crate::domain::channel::ChannelHandle;
 use crate::domain::playlist::PlaylistId;
 use crate::domain::services::{
-    VideoSearcher, VideoSearcherApi, VideoWatchStateUpdater, VideoWatchStateUpdaterApi,
+    SubtitleReader, SubtitleReaderApi, VideoSearcher, VideoSearcherApi, VideoWatchStateUpdater,
+    VideoWatchStateUpdaterApi,
 };
 use crate::domain::video::{
-    HomeLimits, ListVideosError, PlaybackPosition, UpdateWatchStateError, VideoDuration, VideoId,
+    HomeLimits, ListVideosError, PlaybackPosition, ReadSubtitlesError, UpdateWatchStateError,
+    VideoDuration, VideoId, WebVtt,
 };
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::http::header::{CONTENT_TYPE, HeaderName};
 use dto::{HomeResponse, RecordProgressRequest, RecordProgressResponse, VideoResponse};
+
+/// A WebVTT body with its content type header.
+pub type VttResponse = ([(HeaderName, &'static str); 1], String);
+
+const VTT_CONTENT_TYPE: &str = "text/vtt; charset=utf-8";
 
 const HOME_LIMITS: HomeLimits = HomeLimits {
     continue_watching: 6,
@@ -90,6 +98,32 @@ pub async fn mark_video_watched(
     Ok(StatusCode::NO_CONTENT)
 }
 
+pub async fn get_playlist_video_subtitles(
+    State(subtitle_reader): State<SubtitleReader>,
+    Path((playlist_id, youtube_id)): Path<(String, String)>,
+) -> Result<VttResponse, ApiError> {
+    let playlist_id = PlaylistId::new(playlist_id)?;
+    let youtube_id = VideoId::new(youtube_id)?;
+
+    let vtt = run_blocking(move || subtitle_reader.read_for_playlist(&playlist_id, &youtube_id))
+        .await?
+        .map_err(read_subtitles_error)?;
+    Ok(vtt_response(vtt))
+}
+
+pub async fn get_channel_video_subtitles(
+    State(subtitle_reader): State<SubtitleReader>,
+    Path((handle, youtube_id)): Path<(String, String)>,
+) -> Result<VttResponse, ApiError> {
+    let channel_id = ChannelHandle::new(handle)?;
+    let youtube_id = VideoId::new(youtube_id)?;
+
+    let vtt = run_blocking(move || subtitle_reader.read_for_channel(&channel_id, &youtube_id))
+        .await?
+        .map_err(read_subtitles_error)?;
+    Ok(vtt_response(vtt))
+}
+
 pub fn update_watch_state_error(error: UpdateWatchStateError) -> ApiError {
     match error {
         e @ UpdateWatchStateError::VideoNotFound(_) => ApiError::bad_request(e),
@@ -107,6 +141,20 @@ fn list_videos_error(error: ListVideosError) -> ApiError {
     }
 }
 
+fn read_subtitles_error(error: ReadSubtitlesError) -> ApiError {
+    match error {
+        e @ ReadSubtitlesError::PlaylistNotFound(_) => ApiError::new(StatusCode::NOT_FOUND, e),
+        e @ ReadSubtitlesError::ChannelNotFound(_) => ApiError::new(StatusCode::NOT_FOUND, e),
+        e @ ReadSubtitlesError::VideoNotFound(_) => ApiError::new(StatusCode::NOT_FOUND, e),
+        e @ ReadSubtitlesError::SubtitlesNotFound(_) => ApiError::new(StatusCode::NOT_FOUND, e),
+        e @ ReadSubtitlesError::Repository(_) => ApiError::internal(e),
+    }
+}
+
+fn vtt_response(vtt: WebVtt) -> VttResponse {
+    ([(CONTENT_TYPE, VTT_CONTENT_TYPE)], vtt.as_str().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,6 +165,7 @@ mod tests {
     use crate::domain::shared::{Quality, ReconcileInterval};
     use crate::domain::video::{EpisodeNumber, Video};
     use crate::domain::video_metadata::VideoMetadata;
+    use crate::infrastructure::repositories::filesystem_video_file_repository::FakeVideoFileRepository;
     use crate::infrastructure::repositories::sqlite_channel_repository::{
         ChannelRepository, SqliteChannelRepository,
     };
@@ -2631,6 +2680,287 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn it_should_serve_a_playlist_videos_subtitles_as_web_vtt() {
+        let db = TestDatabase::new();
+        let video_repository = Arc::new(SqliteVideoRepository::new(db.database()));
+        let playlist_video_repository = Arc::new(SqlitePlaylistVideoRepository::new(db.database()));
+        let playlist_repository = Arc::new(SqlitePlaylistRepository::new(db.database()));
+        playlist_repository.insert(&playlist("PL1")).unwrap();
+        save_playlist_video(
+            video_repository.as_ref(),
+            playlist_video_repository.as_ref(),
+            "PL1",
+            &video_with_subtitles("vid1"),
+        );
+        let video_file_repository = Arc::new(
+            FakeVideoFileRepository::default()
+                .with_file(format!("{VIDEOS_ROOT}/music/{SUBTITLE_FILENAME}"), SRT),
+        );
+        let subtitle_reader = SubtitleReader::new(
+            playlist_repository,
+            playlist_video_repository,
+            Arc::new(SqliteChannelRepository::new(db.database())),
+            Arc::new(SqliteChannelVideoRepository::new(db.database())),
+            video_repository,
+            video_file_repository,
+            VIDEOS_ROOT,
+        );
+
+        let response = playlist_subtitles(subtitle_reader, "PL1", "vid1").await;
+
+        assert_eq!(response, Ok(vtt_body(VTT)));
+    }
+
+    #[tokio::test]
+    async fn it_should_serve_a_channel_videos_subtitles_as_web_vtt() {
+        let db = TestDatabase::new();
+        let video_repository = Arc::new(SqliteVideoRepository::new(db.database()));
+        let channel_video_repository = Arc::new(SqliteChannelVideoRepository::new(db.database()));
+        let channel_repository = Arc::new(SqliteChannelRepository::new(db.database()));
+        channel_repository
+            .insert(&channel("@somechannel", None))
+            .unwrap();
+        save_channel_video(
+            video_repository.as_ref(),
+            channel_video_repository.as_ref(),
+            "@somechannel",
+            &video_with_subtitles("vid1"),
+            0,
+        );
+        let video_file_repository = Arc::new(FakeVideoFileRepository::default().with_file(
+            format!("{VIDEOS_ROOT}/creators/somechannel/{SUBTITLE_FILENAME}"),
+            SRT,
+        ));
+        let subtitle_reader = SubtitleReader::new(
+            Arc::new(SqlitePlaylistRepository::new(db.database())),
+            Arc::new(SqlitePlaylistVideoRepository::new(db.database())),
+            channel_repository,
+            channel_video_repository,
+            video_repository,
+            video_file_repository,
+            VIDEOS_ROOT,
+        );
+
+        let response = channel_subtitles(subtitle_reader, "@somechannel", "vid1").await;
+
+        assert_eq!(response, Ok(vtt_body(VTT)));
+    }
+
+    #[tokio::test]
+    async fn it_should_fail_to_serve_subtitles_if_not_fetched() {
+        let db = TestDatabase::new();
+        let video_repository = Arc::new(SqliteVideoRepository::new(db.database()));
+        let playlist_video_repository = Arc::new(SqlitePlaylistVideoRepository::new(db.database()));
+        let playlist_repository = Arc::new(SqlitePlaylistRepository::new(db.database()));
+        playlist_repository.insert(&playlist("PL1")).unwrap();
+        save_playlist_video(
+            video_repository.as_ref(),
+            playlist_video_repository.as_ref(),
+            "PL1",
+            &downloaded_video("vid1", "My Video", None, 1_700_000_000),
+        );
+        let video_file_repository = Arc::new(
+            FakeVideoFileRepository::default()
+                .with_file(format!("{VIDEOS_ROOT}/music/{SUBTITLE_FILENAME}"), SRT),
+        );
+        let subtitle_reader = SubtitleReader::new(
+            playlist_repository,
+            playlist_video_repository,
+            Arc::new(SqliteChannelRepository::new(db.database())),
+            Arc::new(SqliteChannelVideoRepository::new(db.database())),
+            video_repository,
+            video_file_repository,
+            VIDEOS_ROOT,
+        );
+
+        let response = playlist_subtitles(subtitle_reader, "PL1", "vid1").await;
+
+        assert_eq!(
+            response,
+            Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "video vid1 has no subtitles"
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn it_should_fail_to_serve_subtitles_if_file_missing() {
+        let db = TestDatabase::new();
+        let video_repository = Arc::new(SqliteVideoRepository::new(db.database()));
+        let playlist_video_repository = Arc::new(SqlitePlaylistVideoRepository::new(db.database()));
+        let playlist_repository = Arc::new(SqlitePlaylistRepository::new(db.database()));
+        playlist_repository.insert(&playlist("PL1")).unwrap();
+        save_playlist_video(
+            video_repository.as_ref(),
+            playlist_video_repository.as_ref(),
+            "PL1",
+            &video_with_subtitles("vid1"),
+        );
+        let subtitle_reader = SubtitleReader::new(
+            playlist_repository,
+            playlist_video_repository,
+            Arc::new(SqliteChannelRepository::new(db.database())),
+            Arc::new(SqliteChannelVideoRepository::new(db.database())),
+            video_repository,
+            Arc::new(FakeVideoFileRepository::default()),
+            VIDEOS_ROOT,
+        );
+
+        let response = playlist_subtitles(subtitle_reader, "PL1", "vid1").await;
+
+        assert_eq!(
+            response,
+            Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "video vid1 has no subtitles"
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn it_should_fail_to_serve_subtitles_if_video_not_in_source() {
+        let db = TestDatabase::new();
+        let video_repository = Arc::new(SqliteVideoRepository::new(db.database()));
+        let playlist_video_repository = Arc::new(SqlitePlaylistVideoRepository::new(db.database()));
+        let playlist_repository = Arc::new(SqlitePlaylistRepository::new(db.database()));
+        playlist_repository.insert(&playlist("PL1")).unwrap();
+        playlist_repository.insert(&playlist("PL2")).unwrap();
+        save_playlist_video(
+            video_repository.as_ref(),
+            playlist_video_repository.as_ref(),
+            "PL2",
+            &video_with_subtitles("vid1"),
+        );
+        let video_file_repository = Arc::new(
+            FakeVideoFileRepository::default()
+                .with_file(format!("{VIDEOS_ROOT}/music/{SUBTITLE_FILENAME}"), SRT),
+        );
+        let subtitle_reader = SubtitleReader::new(
+            playlist_repository,
+            playlist_video_repository,
+            Arc::new(SqliteChannelRepository::new(db.database())),
+            Arc::new(SqliteChannelVideoRepository::new(db.database())),
+            video_repository,
+            video_file_repository,
+            VIDEOS_ROOT,
+        );
+
+        let response = playlist_subtitles(subtitle_reader, "PL1", "vid1").await;
+
+        assert_eq!(
+            response,
+            Err(ApiError::new(StatusCode::NOT_FOUND, "video vid1 not found"))
+        );
+    }
+
+    #[tokio::test]
+    async fn it_should_fail_to_serve_subtitles_if_playlist_not_found() {
+        let db = TestDatabase::new();
+        let subtitle_reader = SubtitleReader::new(
+            Arc::new(SqlitePlaylistRepository::new(db.database())),
+            Arc::new(SqlitePlaylistVideoRepository::new(db.database())),
+            Arc::new(SqliteChannelRepository::new(db.database())),
+            Arc::new(SqliteChannelVideoRepository::new(db.database())),
+            Arc::new(SqliteVideoRepository::new(db.database())),
+            Arc::new(FakeVideoFileRepository::default()),
+            VIDEOS_ROOT,
+        );
+
+        let response = playlist_subtitles(subtitle_reader, "PL1", "vid1").await;
+
+        assert_eq!(
+            response,
+            Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "playlist PL1 not found"
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn it_should_fail_to_serve_subtitles_if_channel_not_found() {
+        let db = TestDatabase::new();
+        let subtitle_reader = SubtitleReader::new(
+            Arc::new(SqlitePlaylistRepository::new(db.database())),
+            Arc::new(SqlitePlaylistVideoRepository::new(db.database())),
+            Arc::new(SqliteChannelRepository::new(db.database())),
+            Arc::new(SqliteChannelVideoRepository::new(db.database())),
+            Arc::new(SqliteVideoRepository::new(db.database())),
+            Arc::new(FakeVideoFileRepository::default()),
+            VIDEOS_ROOT,
+        );
+
+        let response = channel_subtitles(subtitle_reader, "@somechannel", "vid1").await;
+
+        assert_eq!(
+            response,
+            Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "channel @somechannel not found"
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn it_should_fail_to_serve_subtitles_if_invalid_video_id_provided() {
+        let response = playlist_subtitles(any_subtitle_reader(), "PL1", "").await;
+
+        assert_eq!(
+            response,
+            Err(ApiError::bad_request("YouTube video ID must not be empty"))
+        );
+    }
+
+    #[tokio::test]
+    async fn it_should_include_the_subtitle_language_when_listing_videos() {
+        let db = TestDatabase::new();
+        let video_repository = Arc::new(SqliteVideoRepository::new(db.database()));
+        let playlist_video_repository = Arc::new(SqlitePlaylistVideoRepository::new(db.database()));
+        let playlist_repository = Arc::new(SqlitePlaylistRepository::new(db.database()));
+        playlist_repository.insert(&playlist("PL1")).unwrap();
+        [
+            video_with_subtitles("vid1"),
+            downloaded_video("vid2", "Other Video", None, 1_700_000_000),
+        ]
+        .iter()
+        .zip(0..)
+        .for_each(|(video, position)| {
+            video_repository.save(video).unwrap();
+            playlist_video_repository
+                .save(&PlaylistVideo::create(
+                    PlaylistId::new("PL1").unwrap(),
+                    video.id.clone(),
+                    position,
+                    fixed_timestamp(),
+                ))
+                .unwrap();
+        });
+        let video_searcher = VideoSearcher::new(
+            playlist_repository,
+            playlist_video_repository,
+            Arc::new(SqliteChannelRepository::new(db.database())),
+            Arc::new(SqliteChannelVideoRepository::new(db.database())),
+            video_repository,
+            Arc::new(SqliteVideoMetadataRepository::new(db.database())),
+            Arc::new(FixedClock(fixed_timestamp())),
+        );
+
+        let response = list_for_playlist(video_searcher, "PL1").await;
+
+        assert_eq!(
+            response,
+            Ok(vec![
+                VideoResponse {
+                    subtitle_language: Some("en".to_string()),
+                    ..downloaded_video_response("vid1", "My Video")
+                },
+                downloaded_video_response("vid2", "Other Video"),
+            ])
+        );
+    }
+
     /// A searcher for tests whose request is rejected before reaching it. Its
     /// repositories sit on an unmigrated in-memory database, so a request that
     /// wrongly got through would fail loudly instead of passing.
@@ -2654,6 +2984,20 @@ mod tests {
             Arc::new(SqliteChannelRepository::new(unused_connection())),
             Arc::new(SqliteChannelVideoRepository::new(unused_connection())),
             Arc::new(FixedClock(watched_timestamp())),
+        )
+    }
+
+    /// A reader for tests whose request is rejected before reaching it, on
+    /// an unmigrated in-memory database like `any_video_searcher`.
+    fn any_subtitle_reader() -> SubtitleReader {
+        SubtitleReader::new(
+            Arc::new(SqlitePlaylistRepository::new(unused_connection())),
+            Arc::new(SqlitePlaylistVideoRepository::new(unused_connection())),
+            Arc::new(SqliteChannelRepository::new(unused_connection())),
+            Arc::new(SqliteChannelVideoRepository::new(unused_connection())),
+            Arc::new(SqliteVideoRepository::new(unused_connection())),
+            Arc::new(FakeVideoFileRepository::default()),
+            VIDEOS_ROOT,
         )
     }
 
@@ -2790,6 +3134,17 @@ mod tests {
             published_at: None,
             description: None,
             channel_name: None,
+            subtitle_language: None,
+        }
+    }
+
+    fn downloaded_video_response(youtube_id: &str, title: &str) -> VideoResponse {
+        VideoResponse {
+            status: "DOWNLOADED".to_string(),
+            quality: Some("high".to_string()),
+            filename: Some(format!("{title}.mp4")),
+            synced_at: Some(fixed_timestamp()),
+            ..pending_video_response(youtube_id, title)
         }
     }
 
@@ -2993,6 +3348,49 @@ mod tests {
         list_videos_for_channel(State(video_searcher), Path(handle.to_string()))
             .await
             .map(|Json(videos)| videos)
+    }
+
+    const VIDEOS_ROOT: &str = "/videos";
+    const SUBTITLE_FILENAME: &str = "Season 1/S01E001 - My Video.en.srt";
+    const SRT: &str = "1\n00:00:01,500 --> 00:00:03,000\nHello there\n\n2\n00:00:03,000 --> 00:00:04,250\nGeneral Kenobi\n";
+    const VTT: &str = "WEBVTT\n\n1\n00:00:01.500 --> 00:00:03.000\nHello there\n\n2\n00:00:03.000 --> 00:00:04.250\nGeneral Kenobi\n";
+
+    /// A downloaded video whose `en` subtitles are fetched as
+    /// `SUBTITLE_FILENAME`.
+    fn video_with_subtitles(youtube_id: &str) -> Video {
+        downloaded_video(youtube_id, "My Video", None, 1_700_000_000)
+            .with_subtitles(SUBTITLE_FILENAME, fixed_timestamp())
+    }
+
+    fn vtt_body(body: &str) -> VttResponse {
+        (
+            [(CONTENT_TYPE, "text/vtt; charset=utf-8")],
+            body.to_string(),
+        )
+    }
+
+    async fn playlist_subtitles(
+        subtitle_reader: SubtitleReader,
+        playlist_id: &str,
+        youtube_id: &str,
+    ) -> Result<VttResponse, ApiError> {
+        get_playlist_video_subtitles(
+            State(subtitle_reader),
+            Path((playlist_id.to_string(), youtube_id.to_string())),
+        )
+        .await
+    }
+
+    async fn channel_subtitles(
+        subtitle_reader: SubtitleReader,
+        handle: &str,
+        youtube_id: &str,
+    ) -> Result<VttResponse, ApiError> {
+        get_channel_video_subtitles(
+            State(subtitle_reader),
+            Path((handle.to_string(), youtube_id.to_string())),
+        )
+        .await
     }
 
     async fn home(video_searcher: VideoSearcher) -> Result<HomeResponse, ApiError> {

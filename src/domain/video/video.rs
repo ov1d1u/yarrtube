@@ -313,6 +313,17 @@ impl Video {
         }
     }
 
+    /// The language code the fetched subtitle file is named with (`en` for
+    /// `… .en.srt`); `None` unless the subtitles are Fetched.
+    pub fn subtitle_language(&self) -> Option<String> {
+        self.subtitle_filename
+            .as_deref()
+            .filter(|_| self.subtitle_state == SubtitleState::Fetched)
+            .and_then(|filename| filename.strip_suffix(".srt"))
+            .and_then(|stem| stem.rsplit_once('.'))
+            .map(|(_, language)| language.to_string())
+    }
+
     /// The video has no original-language captions: a terminal subtitle
     /// state.
     pub fn mark_subtitles_unavailable(self, now: DateTime<Utc>) -> Self {
@@ -626,6 +637,25 @@ mod tests {
                 ..video
             }
         );
+    }
+
+    #[test]
+    fn it_should_report_the_subtitle_language_from_its_filename() {
+        let now = DateTime::<Utc>::from_timestamp(100, 0).unwrap();
+        let filename = "Season 1/S01E003 - My Video.en.srt";
+
+        let languages = [
+            video().with_subtitles(filename, now),
+            video(),
+            Video {
+                subtitle_state: SubtitleState::Unavailable,
+                subtitle_filename: Some(filename.to_string()),
+                ..video()
+            },
+        ]
+        .map(|video| video.subtitle_language());
+
+        assert_eq!(languages, [Some("en".to_string()), None, None]);
     }
 
     #[test]
