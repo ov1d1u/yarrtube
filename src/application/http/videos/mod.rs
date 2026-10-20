@@ -3,6 +3,7 @@ pub mod dto;
 use super::blocking::run_blocking;
 use super::error::ApiError;
 use super::validation::{MISSING_POSITION, MISSING_WAS_WATCHED, required};
+use crate::domain::category::CategoryId;
 use crate::domain::channel::ChannelHandle;
 use crate::domain::playlist::PlaylistId;
 use crate::domain::services::{
@@ -17,7 +18,9 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::http::header::{CONTENT_TYPE, HeaderName};
-use dto::{HomeResponse, RecordProgressRequest, RecordProgressResponse, VideoResponse};
+use dto::{
+    HomeResponse, HomeVideoResponse, RecordProgressRequest, RecordProgressResponse, VideoResponse,
+};
 
 /// A WebVTT body with its content type header.
 pub type VttResponse = ([(HeaderName, &'static str); 1], String);
@@ -52,6 +55,20 @@ pub async fn list_videos_for_channel(
         .await?
         .map_err(list_videos_error)?;
     Ok(Json(videos.into_iter().map(VideoResponse::from).collect()))
+}
+
+pub async fn list_videos_for_category(
+    State(video_searcher): State<VideoSearcher>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<HomeVideoResponse>>, ApiError> {
+    let id = CategoryId::new(id)?;
+
+    let videos = run_blocking(move || video_searcher.list_for_category(&id))
+        .await?
+        .map_err(list_videos_error)?;
+    Ok(Json(
+        videos.into_iter().map(HomeVideoResponse::from).collect(),
+    ))
 }
 
 pub async fn list_home_videos(
@@ -129,6 +146,7 @@ pub fn update_watch_state_error(error: UpdateWatchStateError) -> ApiError {
         e @ UpdateWatchStateError::VideoNotFound(_) => ApiError::bad_request(e),
         e @ UpdateWatchStateError::VideoNotDownloaded(_) => ApiError::bad_request(e),
         e @ UpdateWatchStateError::ChannelNotFound(_) => ApiError::bad_request(e),
+        e @ UpdateWatchStateError::CategoryNotFound(_) => ApiError::new(StatusCode::NOT_FOUND, e),
         e @ UpdateWatchStateError::Repository(_) => ApiError::internal(e),
     }
 }
@@ -137,6 +155,7 @@ fn list_videos_error(error: ListVideosError) -> ApiError {
     match error {
         e @ ListVideosError::PlaylistNotFound(_) => ApiError::bad_request(e),
         e @ ListVideosError::ChannelNotFound(_) => ApiError::bad_request(e),
+        e @ ListVideosError::CategoryNotFound(_) => ApiError::new(StatusCode::NOT_FOUND, e),
         e @ ListVideosError::Repository(_) => ApiError::internal(e),
     }
 }
@@ -158,14 +177,19 @@ fn vtt_response(vtt: WebVtt) -> VttResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::category::{Category, CategoryMember, CategoryName};
     use crate::domain::channel::{Channel, VideoLimit};
     use crate::domain::channel_video::ChannelVideo;
     use crate::domain::playlist::{Playlist, PlaylistKind, PlaylistName, PlaylistPath};
     use crate::domain::playlist_video::PlaylistVideo;
+    use crate::domain::services::CategoryVideoCollector;
     use crate::domain::shared::{Quality, ReconcileInterval};
     use crate::domain::video::{EpisodeNumber, Video};
     use crate::domain::video_metadata::VideoMetadata;
     use crate::infrastructure::repositories::filesystem_video_file_repository::FakeVideoFileRepository;
+    use crate::infrastructure::repositories::sqlite_category_repository::{
+        CategoryRepository, SqliteCategoryRepository,
+    };
     use crate::infrastructure::repositories::sqlite_channel_repository::{
         ChannelRepository, SqliteChannelRepository,
     };
@@ -187,7 +211,7 @@ mod tests {
     use crate::infrastructure::shared::sqlite_connection::TestDatabase;
     use crate::infrastructure::shared::system_clock::FixedClock;
     use chrono::{DateTime, Duration, Utc};
-    use dto::{HomeVideoResponse, HomeVideoSourceResponse};
+    use dto::HomeVideoSourceResponse;
     use rusqlite::Connection;
     use std::sync::Arc;
 
@@ -213,6 +237,8 @@ mod tests {
             video_repository,
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             Arc::new(FixedClock(fixed_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = list_for_playlist(video_searcher, "PL1").await;
@@ -253,6 +279,8 @@ mod tests {
             video_repository,
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             Arc::new(FixedClock(fixed_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = list_for_playlist(video_searcher, "PL1").await;
@@ -296,6 +324,8 @@ mod tests {
             video_repository,
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             Arc::new(FixedClock(fixed_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = list_for_playlist(video_searcher, "PL1").await;
@@ -347,6 +377,8 @@ mod tests {
             video_repository,
             video_metadata_repository,
             Arc::new(FixedClock(fixed_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = list_for_playlist(video_searcher, "PL1").await;
@@ -389,6 +421,8 @@ mod tests {
             video_repository,
             video_metadata_repository.clone(),
             Arc::new(FixedClock(fixed_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = list_for_playlist(video_searcher, "PL1").await;
@@ -436,6 +470,8 @@ mod tests {
             video_repository,
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             Arc::new(FixedClock(fixed_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = list_for_playlist(video_searcher, "PL1").await;
@@ -497,6 +533,8 @@ mod tests {
             video_repository,
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             Arc::new(FixedClock(fixed_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = list_for_playlist(video_searcher, "PL1").await;
@@ -530,6 +568,8 @@ mod tests {
             video_repository,
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             Arc::new(FixedClock(fixed_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = list_for_playlist(video_searcher, "PL1").await;
@@ -572,6 +612,8 @@ mod tests {
             video_repository,
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             Arc::new(FixedClock(fixed_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = list_for_playlist(video_searcher, "PL1").await;
@@ -595,6 +637,8 @@ mod tests {
             video_repository,
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             Arc::new(FixedClock(fixed_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = list_for_playlist(video_searcher, "PL404").await;
@@ -646,6 +690,8 @@ mod tests {
             video_repository,
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             Arc::new(FixedClock(fixed_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = list_for_channel(video_searcher, "@somechannel").await;
@@ -696,6 +742,8 @@ mod tests {
             video_repository,
             video_metadata_repository,
             Arc::new(FixedClock(fixed_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = list_for_channel(video_searcher, "@somechannel").await;
@@ -758,6 +806,8 @@ mod tests {
             video_repository,
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             Arc::new(FixedClock(fixed_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = list_for_channel(video_searcher, "@somechannel").await;
@@ -793,6 +843,8 @@ mod tests {
             video_repository,
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             Arc::new(FixedClock(fixed_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = list_for_channel(video_searcher, "@somechannel").await;
@@ -839,6 +891,8 @@ mod tests {
             video_repository,
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             Arc::new(FixedClock(fixed_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = list_for_channel(video_searcher, "@somechannel").await;
@@ -862,6 +916,8 @@ mod tests {
             video_repository,
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             Arc::new(FixedClock(fixed_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = list_for_channel(video_searcher, "@missing").await;
@@ -905,6 +961,8 @@ mod tests {
             video_repository,
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = home(video_searcher).await;
@@ -947,6 +1005,8 @@ mod tests {
             video_repository,
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = home(video_searcher).await;
@@ -984,6 +1044,8 @@ mod tests {
             video_repository,
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = home(video_searcher).await;
@@ -1024,6 +1086,8 @@ mod tests {
             video_repository,
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = home(video_searcher).await;
@@ -1074,6 +1138,8 @@ mod tests {
             video_repository,
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = home(video_searcher).await;
@@ -1111,6 +1177,8 @@ mod tests {
             video_repository,
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = home(video_searcher).await;
@@ -1137,6 +1205,8 @@ mod tests {
             video_repository,
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = home(video_searcher).await;
@@ -1182,6 +1252,8 @@ mod tests {
             video_repository,
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = home(video_searcher).await;
@@ -1229,6 +1301,8 @@ mod tests {
             video_repository,
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = home(video_searcher).await;
@@ -1273,6 +1347,8 @@ mod tests {
             video_repository,
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = home(video_searcher).await;
@@ -1317,6 +1393,8 @@ mod tests {
             video_repository,
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = home(video_searcher).await;
@@ -1367,6 +1445,8 @@ mod tests {
             video_repository,
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = home(video_searcher).await;
@@ -1423,6 +1503,8 @@ mod tests {
             video_repository,
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = home(video_searcher).await;
@@ -1457,6 +1539,8 @@ mod tests {
             video_repository,
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = home(video_searcher).await;
@@ -1498,6 +1582,8 @@ mod tests {
             video_repository,
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = home(video_searcher).await;
@@ -1539,6 +1625,8 @@ mod tests {
             video_repository,
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = home(video_searcher).await;
@@ -1595,6 +1683,8 @@ mod tests {
             video_repository,
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = home(video_searcher).await;
@@ -1645,6 +1735,8 @@ mod tests {
             video_repository,
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = home(video_searcher).await;
@@ -1704,6 +1796,8 @@ mod tests {
             video_repository,
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = home(video_searcher).await;
@@ -1755,6 +1849,8 @@ mod tests {
             video_repository,
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = home(video_searcher).await;
@@ -1809,6 +1905,8 @@ mod tests {
             video_repository,
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = home(video_searcher).await;
@@ -1870,6 +1968,8 @@ mod tests {
             video_repository,
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = home(video_searcher).await;
@@ -1913,6 +2013,8 @@ mod tests {
             video_repository,
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = home(video_searcher).await;
@@ -1962,6 +2064,8 @@ mod tests {
             video_repository,
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = home(video_searcher).await;
@@ -2003,6 +2107,8 @@ mod tests {
             video_repository,
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = home(video_searcher).await;
@@ -2042,6 +2148,8 @@ mod tests {
             video_repository,
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = home(video_searcher).await;
@@ -2092,6 +2200,8 @@ mod tests {
             video_repository,
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = home(video_searcher).await;
@@ -2119,6 +2229,8 @@ mod tests {
             Arc::new(SqliteChannelRepository::new(db.database())),
             Arc::new(SqliteChannelVideoRepository::new(db.database())),
             Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
         let request = progress_request(30);
 
@@ -2146,6 +2258,8 @@ mod tests {
             Arc::new(SqliteChannelRepository::new(db.database())),
             Arc::new(SqliteChannelVideoRepository::new(db.database())),
             Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
         let request = progress_request(95);
 
@@ -2176,6 +2290,8 @@ mod tests {
             Arc::new(SqliteChannelRepository::new(db.database())),
             Arc::new(SqliteChannelVideoRepository::new(db.database())),
             Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
         let request = progress_request(90);
 
@@ -2204,6 +2320,8 @@ mod tests {
             Arc::new(SqliteChannelRepository::new(db.database())),
             Arc::new(SqliteChannelVideoRepository::new(db.database())),
             Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
         let request = RecordProgressRequest {
             duration_seconds: Some(100),
@@ -2234,6 +2352,8 @@ mod tests {
             Arc::new(SqliteChannelRepository::new(db.database())),
             Arc::new(SqliteChannelVideoRepository::new(db.database())),
             Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
         let request = progress_request(500);
 
@@ -2261,6 +2381,8 @@ mod tests {
             Arc::new(SqliteChannelRepository::new(db.database())),
             Arc::new(SqliteChannelVideoRepository::new(db.database())),
             Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
         let request = RecordProgressRequest {
             was_watched: Some(true),
@@ -2292,6 +2414,8 @@ mod tests {
             Arc::new(SqliteChannelRepository::new(db.database())),
             Arc::new(SqliteChannelVideoRepository::new(db.database())),
             Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
         let request = RecordProgressRequest {
             was_watched: Some(true),
@@ -2342,6 +2466,8 @@ mod tests {
             channel_repository,
             channel_video_repository,
             Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
         let request = progress_request(40);
 
@@ -2376,6 +2502,8 @@ mod tests {
             Arc::new(SqliteChannelRepository::new(db.database())),
             Arc::new(SqliteChannelVideoRepository::new(db.database())),
             Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
         let request = RecordProgressRequest {
             was_watched: Some(true),
@@ -2405,6 +2533,8 @@ mod tests {
             Arc::new(SqliteChannelRepository::new(db.database())),
             Arc::new(SqliteChannelVideoRepository::new(db.database())),
             Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
         let request = RecordProgressRequest {
             was_watched: Some(false),
@@ -2428,6 +2558,8 @@ mod tests {
             Arc::new(SqliteChannelRepository::new(db.database())),
             Arc::new(SqliteChannelVideoRepository::new(db.database())),
             Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
         let request = progress_request(30);
 
@@ -2516,6 +2648,8 @@ mod tests {
             Arc::new(SqliteChannelRepository::new(db.database())),
             Arc::new(SqliteChannelVideoRepository::new(db.database())),
             Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = mark_watched(video_watch_state_updater, "vid1").await;
@@ -2563,6 +2697,8 @@ mod tests {
             channel_repository,
             channel_video_repository,
             Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = mark_watched(video_watch_state_updater, "vid1").await;
@@ -2594,6 +2730,8 @@ mod tests {
             Arc::new(SqliteChannelRepository::new(db.database())),
             Arc::new(SqliteChannelVideoRepository::new(db.database())),
             Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = mark_watched(video_watch_state_updater, "vid1").await;
@@ -2621,6 +2759,8 @@ mod tests {
             Arc::new(SqliteChannelRepository::new(db.database())),
             Arc::new(SqliteChannelVideoRepository::new(db.database())),
             Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = mark_watched(video_watch_state_updater, "vid1").await;
@@ -2640,6 +2780,8 @@ mod tests {
             Arc::new(SqliteChannelRepository::new(db.database())),
             Arc::new(SqliteChannelVideoRepository::new(db.database())),
             Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = mark_watched(video_watch_state_updater, "vid1").await;
@@ -2662,6 +2804,8 @@ mod tests {
             Arc::new(SqliteChannelRepository::new(db.database())),
             Arc::new(SqliteChannelVideoRepository::new(db.database())),
             Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = mark_watched(video_watch_state_updater, "x").await;
@@ -2945,6 +3089,8 @@ mod tests {
             video_repository,
             Arc::new(SqliteVideoMetadataRepository::new(db.database())),
             Arc::new(FixedClock(fixed_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
         );
 
         let response = list_for_playlist(video_searcher, "PL1").await;
@@ -2961,6 +3107,289 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn it_should_list_videos_for_a_category() {
+        let db = TestDatabase::new();
+        let video_repository = Arc::new(SqliteVideoRepository::new(db.database()));
+        let playlist_video_repository = Arc::new(SqlitePlaylistVideoRepository::new(db.database()));
+        let channel_video_repository = Arc::new(SqliteChannelVideoRepository::new(db.database()));
+        let playlist_repository = Arc::new(SqlitePlaylistRepository::new(db.database()));
+        let channel_repository = Arc::new(SqliteChannelRepository::new(db.database()));
+        let category_repository = Arc::new(SqliteCategoryRepository::new(db.database()));
+        playlist_repository.insert(&playlist("PL1")).unwrap();
+        channel_repository
+            .insert(&channel("@somechannel", Some("avatar.jpg")))
+            .unwrap();
+        save_channel_video(
+            video_repository.as_ref(),
+            channel_video_repository.as_ref(),
+            "@somechannel",
+            &downloaded_video("vid1", "Oldest", None, 10),
+            1,
+        );
+        save_channel_video(
+            video_repository.as_ref(),
+            channel_video_repository.as_ref(),
+            "@somechannel",
+            &downloaded_video("vid3", "Newest", Some("vid3.jpg"), 30),
+            0,
+        );
+        save_playlist_video(
+            video_repository.as_ref(),
+            playlist_video_repository.as_ref(),
+            "PL1",
+            &downloaded_video("vid2", "Middle", None, 20),
+        );
+        let chess =
+            category_with_members(&[channel_member("@somechannel"), playlist_member("PL1")]);
+        category_repository.insert(&chess).unwrap();
+        let video_searcher = VideoSearcher::new(
+            playlist_repository,
+            playlist_video_repository,
+            channel_repository,
+            channel_video_repository,
+            video_repository,
+            Arc::new(SqliteVideoMetadataRepository::new(db.database())),
+            Arc::new(FixedClock(fixed_timestamp())),
+            category_repository,
+            category_video_collector(&db),
+        );
+
+        let response = list_for_category(video_searcher, chess.id.as_str()).await;
+
+        assert_eq!(
+            response,
+            Ok(vec![
+                HomeVideoResponse {
+                    thumbnail_filename: Some("vid3.jpg".to_string()),
+                    ..home_video_response("vid3", "Newest", channel_source(Some("avatar.jpg")))
+                },
+                home_video_response("vid2", "Middle", playlist_source()),
+                home_video_response("vid1", "Oldest", channel_source(Some("avatar.jpg"))),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn it_should_list_a_shared_video_once_from_the_channel() {
+        let db = TestDatabase::new();
+        let video_repository = Arc::new(SqliteVideoRepository::new(db.database()));
+        let playlist_video_repository = Arc::new(SqlitePlaylistVideoRepository::new(db.database()));
+        let channel_video_repository = Arc::new(SqliteChannelVideoRepository::new(db.database()));
+        let playlist_repository = Arc::new(SqlitePlaylistRepository::new(db.database()));
+        let channel_repository = Arc::new(SqliteChannelRepository::new(db.database()));
+        let category_repository = Arc::new(SqliteCategoryRepository::new(db.database()));
+        playlist_repository.insert(&playlist("PL1")).unwrap();
+        channel_repository
+            .insert(&channel("@somechannel", None))
+            .unwrap();
+        save_playlist_video(
+            video_repository.as_ref(),
+            playlist_video_repository.as_ref(),
+            "PL1",
+            &downloaded_video("vid_shared", "Shared", None, 20),
+        );
+        save_channel_video(
+            video_repository.as_ref(),
+            channel_video_repository.as_ref(),
+            "@somechannel",
+            &downloaded_video("vid_shared", "Shared", None, 10),
+            0,
+        );
+        let chess =
+            category_with_members(&[playlist_member("PL1"), channel_member("@somechannel")]);
+        category_repository.insert(&chess).unwrap();
+        let video_searcher = VideoSearcher::new(
+            playlist_repository,
+            playlist_video_repository,
+            channel_repository,
+            channel_video_repository,
+            video_repository,
+            Arc::new(SqliteVideoMetadataRepository::new(db.database())),
+            Arc::new(FixedClock(fixed_timestamp())),
+            category_repository,
+            category_video_collector(&db),
+        );
+
+        let response = list_for_category(video_searcher, chess.id.as_str()).await;
+
+        assert_eq!(
+            response,
+            Ok(vec![home_video_response(
+                "vid_shared",
+                "Shared",
+                channel_source(None)
+            )])
+        );
+    }
+
+    #[tokio::test]
+    async fn it_should_list_only_downloaded_videos_for_a_category() {
+        let db = TestDatabase::new();
+        let video_repository = Arc::new(SqliteVideoRepository::new(db.database()));
+        let channel_video_repository = Arc::new(SqliteChannelVideoRepository::new(db.database()));
+        let channel_repository = Arc::new(SqliteChannelRepository::new(db.database()));
+        let category_repository = Arc::new(SqliteCategoryRepository::new(db.database()));
+        channel_repository
+            .insert(&channel("@somechannel", None))
+            .unwrap();
+        let pending = |youtube_id: &str| {
+            Video::create(
+                VideoId::new(youtube_id).unwrap(),
+                "Not downloaded",
+                fixed_timestamp(),
+            )
+        };
+        [
+            downloaded_video("vid1", "Downloaded", None, 10),
+            pending("pending"),
+            pending("downloading").start_download(fixed_timestamp()),
+            pending("failed").mark_errored(fixed_timestamp()),
+            pending("excluded").mark_excluded(fixed_timestamp()),
+        ]
+        .iter()
+        .for_each(|video| {
+            save_channel_video(
+                video_repository.as_ref(),
+                channel_video_repository.as_ref(),
+                "@somechannel",
+                video,
+                0,
+            )
+        });
+        let chess = category_with_members(&[channel_member("@somechannel")]);
+        category_repository.insert(&chess).unwrap();
+        let video_searcher = VideoSearcher::new(
+            Arc::new(SqlitePlaylistRepository::new(db.database())),
+            Arc::new(SqlitePlaylistVideoRepository::new(db.database())),
+            channel_repository,
+            channel_video_repository,
+            video_repository,
+            Arc::new(SqliteVideoMetadataRepository::new(db.database())),
+            Arc::new(FixedClock(fixed_timestamp())),
+            category_repository,
+            category_video_collector(&db),
+        );
+
+        let response = list_for_category(video_searcher, chess.id.as_str()).await;
+
+        assert_eq!(
+            response,
+            Ok(vec![home_video_response(
+                "vid1",
+                "Downloaded",
+                channel_source(None)
+            )])
+        );
+    }
+
+    #[tokio::test]
+    async fn it_should_list_videos_of_a_playlist_excluded_from_home_for_a_category() {
+        let db = TestDatabase::new();
+        let video_repository = Arc::new(SqliteVideoRepository::new(db.database()));
+        let playlist_video_repository = Arc::new(SqlitePlaylistVideoRepository::new(db.database()));
+        let playlist_repository = Arc::new(SqlitePlaylistRepository::new(db.database()));
+        let category_repository = Arc::new(SqliteCategoryRepository::new(db.database()));
+        playlist_repository
+            .insert(&Playlist {
+                exclude_from_home: true,
+                ..playlist("PL1")
+            })
+            .unwrap();
+        save_playlist_video(
+            video_repository.as_ref(),
+            playlist_video_repository.as_ref(),
+            "PL1",
+            &downloaded_video("vid1", "Excluded from home", None, 10),
+        );
+        let chess = category_with_members(&[playlist_member("PL1")]);
+        category_repository.insert(&chess).unwrap();
+        let video_searcher = VideoSearcher::new(
+            playlist_repository,
+            playlist_video_repository,
+            Arc::new(SqliteChannelRepository::new(db.database())),
+            Arc::new(SqliteChannelVideoRepository::new(db.database())),
+            video_repository,
+            Arc::new(SqliteVideoMetadataRepository::new(db.database())),
+            Arc::new(FixedClock(fixed_timestamp())),
+            category_repository,
+            category_video_collector(&db),
+        );
+
+        let response = list_for_category(video_searcher, chess.id.as_str()).await;
+
+        assert_eq!(
+            response,
+            Ok(vec![home_video_response(
+                "vid1",
+                "Excluded from home",
+                playlist_source()
+            )])
+        );
+    }
+
+    #[tokio::test]
+    async fn it_should_list_no_videos_for_a_category_without_members() {
+        let db = TestDatabase::new();
+        let video_repository = Arc::new(SqliteVideoRepository::new(db.database()));
+        let channel_video_repository = Arc::new(SqliteChannelVideoRepository::new(db.database()));
+        let channel_repository = Arc::new(SqliteChannelRepository::new(db.database()));
+        let category_repository = Arc::new(SqliteCategoryRepository::new(db.database()));
+        channel_repository
+            .insert(&channel("@somechannel", None))
+            .unwrap();
+        save_channel_video(
+            video_repository.as_ref(),
+            channel_video_repository.as_ref(),
+            "@somechannel",
+            &downloaded_video("vid1", "Not in the category", None, 10),
+            0,
+        );
+        let chess = category_with_members(&[]);
+        category_repository.insert(&chess).unwrap();
+        let video_searcher = VideoSearcher::new(
+            Arc::new(SqlitePlaylistRepository::new(db.database())),
+            Arc::new(SqlitePlaylistVideoRepository::new(db.database())),
+            channel_repository,
+            channel_video_repository,
+            video_repository,
+            Arc::new(SqliteVideoMetadataRepository::new(db.database())),
+            Arc::new(FixedClock(fixed_timestamp())),
+            category_repository,
+            category_video_collector(&db),
+        );
+
+        let response = list_for_category(video_searcher, chess.id.as_str()).await;
+
+        assert_eq!(response, Ok(vec![]));
+    }
+
+    #[tokio::test]
+    async fn it_should_fail_to_list_videos_for_a_missing_category() {
+        let db = TestDatabase::new();
+        let video_searcher = VideoSearcher::new(
+            Arc::new(SqlitePlaylistRepository::new(db.database())),
+            Arc::new(SqlitePlaylistVideoRepository::new(db.database())),
+            Arc::new(SqliteChannelRepository::new(db.database())),
+            Arc::new(SqliteChannelVideoRepository::new(db.database())),
+            Arc::new(SqliteVideoRepository::new(db.database())),
+            Arc::new(SqliteVideoMetadataRepository::new(db.database())),
+            Arc::new(FixedClock(fixed_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
+        );
+
+        let response = list_for_category(video_searcher, "missing").await;
+
+        assert_eq!(
+            response,
+            Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "category missing not found"
+            ))
+        );
+    }
+
     /// A searcher for tests whose request is rejected before reaching it. Its
     /// repositories sit on an unmigrated in-memory database, so a request that
     /// wrongly got through would fail loudly instead of passing.
@@ -2973,6 +3402,8 @@ mod tests {
             Arc::new(SqliteVideoRepository::new(unused_connection())),
             Arc::new(SqliteVideoMetadataRepository::new(unused_connection())),
             Arc::new(FixedClock(fixed_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(unused_connection())),
+            any_category_video_collector(),
         )
     }
 
@@ -2984,6 +3415,8 @@ mod tests {
             Arc::new(SqliteChannelRepository::new(unused_connection())),
             Arc::new(SqliteChannelVideoRepository::new(unused_connection())),
             Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(unused_connection())),
+            any_category_video_collector(),
         )
     }
 
@@ -2998,6 +3431,30 @@ mod tests {
             Arc::new(SqliteVideoRepository::new(unused_connection())),
             Arc::new(FakeVideoFileRepository::default()),
             VIDEOS_ROOT,
+        )
+    }
+
+    /// The collector the searcher and updater read category videos through,
+    /// on `db` like the repositories each test seeds.
+    fn category_video_collector(db: &TestDatabase) -> CategoryVideoCollector {
+        CategoryVideoCollector::new(
+            Arc::new(SqliteChannelRepository::new(db.database())),
+            Arc::new(SqliteChannelVideoRepository::new(db.database())),
+            Arc::new(SqlitePlaylistRepository::new(db.database())),
+            Arc::new(SqlitePlaylistVideoRepository::new(db.database())),
+            Arc::new(SqliteVideoRepository::new(db.database())),
+        )
+    }
+
+    /// A collector on an unmigrated in-memory database, like
+    /// `any_video_searcher`.
+    fn any_category_video_collector() -> CategoryVideoCollector {
+        CategoryVideoCollector::new(
+            Arc::new(SqliteChannelRepository::new(unused_connection())),
+            Arc::new(SqliteChannelVideoRepository::new(unused_connection())),
+            Arc::new(SqlitePlaylistRepository::new(unused_connection())),
+            Arc::new(SqlitePlaylistVideoRepository::new(unused_connection())),
+            Arc::new(SqliteVideoRepository::new(unused_connection())),
         )
     }
 
@@ -3184,6 +3641,19 @@ mod tests {
         }
     }
 
+    fn category_with_members(members: &[CategoryMember]) -> Category {
+        Category::create(CategoryName::new("Chess").unwrap(), fixed_timestamp())
+            .with_members(members.to_vec())
+    }
+
+    fn channel_member(handle: &str) -> CategoryMember {
+        CategoryMember::Channel(ChannelHandle::new(handle).unwrap())
+    }
+
+    fn playlist_member(id: &str) -> CategoryMember {
+        CategoryMember::Playlist(PlaylistId::new(id).unwrap())
+    }
+
     fn fixed_timestamp() -> DateTime<Utc> {
         DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap()
     }
@@ -3337,6 +3807,15 @@ mod tests {
         playlist_id: &str,
     ) -> Result<Vec<VideoResponse>, ApiError> {
         list_videos_for_playlist(State(video_searcher), Path(playlist_id.to_string()))
+            .await
+            .map(|Json(videos)| videos)
+    }
+
+    async fn list_for_category(
+        video_searcher: VideoSearcher,
+        id: &str,
+    ) -> Result<Vec<HomeVideoResponse>, ApiError> {
+        list_videos_for_category(State(video_searcher), Path(id.to_string()))
             .await
             .map(|Json(videos)| videos)
     }

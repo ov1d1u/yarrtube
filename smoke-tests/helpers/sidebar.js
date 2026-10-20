@@ -1,7 +1,27 @@
 import { expect } from '@playwright/test'
 
+// The heading's row (its `h3` plus the add "+"), which the section's add row,
+// list and empty/error messages follow as siblings.
+function headingRow(section) {
+  return `div:has(> h3 > button:text-is("${section}"))`
+}
+
+export function sectionList(page, section) {
+  return page.locator(`${headingRow(section)} ~ ul`)
+}
+
 export function sectionRows(page, section) {
-  return page.locator(`h3:text-is("${section}") ~ ul li`)
+  return sectionList(page, section).locator('li')
+}
+
+export function sectionEmptyMessage(page, section) {
+  return page.locator(`${headingRow(section)} ~ p`)
+}
+
+// The heading toggle that folds a section; while folded its name also
+// carries the section's unwatched total ("Channels 3 unwatched").
+export function sectionHeading(page, section) {
+  return page.getByRole('button', { name: new RegExp(`^${section}( \\d+ unwatched)?$`) })
 }
 
 async function rowFor(page, section, name) {

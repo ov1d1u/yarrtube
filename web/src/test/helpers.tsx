@@ -1,12 +1,15 @@
 import type { ReactElement, ReactNode } from 'react'
 import { render } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { MemoryRouter } from 'react-router-dom'
+import { MemoryRouter, type InitialEntry } from 'react-router-dom'
 import { vi } from 'vitest'
 import type {
   Announcement,
   AppVersion,
+  Category,
+  CategoryList,
   ChannelListItem,
+  CreatedCategory,
   HomeVideo,
   PlaylistListItem,
   Task,
@@ -68,10 +71,14 @@ function jsonResponse(body: unknown, status: number): Response {
 
 /**
  * Renders `ui` inside a fresh react-query client and a memory router, the
- * providers every routed component expects. Retries and polling are off so
+ * providers every routed component expects. `route` is a path, or a location
+ * carrying navigation state. Retries and polling are off so
  * tests stay deterministic.
  */
-export function renderWithProviders(ui: ReactElement, { route = '/' }: { route?: string } = {}) {
+export function renderWithProviders(
+  ui: ReactElement,
+  { route = '/' }: { route?: InitialEntry } = {},
+) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false, refetchInterval: false } },
   })
@@ -191,6 +198,40 @@ export function aVersion(overrides: Partial<AppVersion> = {}): AppVersion {
       subject: 'Fix sync',
       date: '2026-10-19T10:00:00Z',
     },
+    ...overrides,
+  }
+}
+
+export function aCategory(overrides: Partial<Category> = {}): Category {
+  uniqueId += 1
+  return {
+    id: `category-${uniqueId}`,
+    name: `Category ${uniqueId}`,
+    unwatched_count: 0,
+    channels: [],
+    playlists: [],
+    ...overrides,
+  }
+}
+
+export function aCreatedCategory(overrides: Partial<CreatedCategory> = {}): CreatedCategory {
+  uniqueId += 1
+  return {
+    id: `category-${uniqueId}`,
+    name: `Category ${uniqueId}`,
+    channels: [],
+    playlists: [],
+    ...overrides,
+  }
+}
+
+export function aCategoryList(
+  categories: Category[] = [],
+  overrides: Partial<CategoryList> = {},
+): CategoryList {
+  return {
+    categories,
+    unwatched_total: 0,
     ...overrides,
   }
 }

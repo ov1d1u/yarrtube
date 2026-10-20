@@ -9,6 +9,9 @@ import {
   fetchTasks,
   fetchVersion,
   fetchVideos,
+  listCategories,
+  listCategoryVideos,
+  markCategoryWatched,
   markVideoWatched,
   previewChannel,
   previewPlaylist,
@@ -20,8 +23,10 @@ import {
 import type {
   Announcement,
   AppVersion,
+  CategoryList,
   ChannelListItem,
   ChannelPreview,
+  HomeVideo,
   HomeVideos,
   PlaylistListItem,
   PlaylistPreview,
@@ -37,6 +42,8 @@ const LIVE_INTERVAL_MS = 3_000
 export const queryKeys = {
   channels: ['channels'] as const,
   playlists: ['playlists'] as const,
+  categories: ['categories'] as const,
+  categoryVideos: (id: string) => ['categories', id, 'videos'] as const,
   channelVideos: (handle: string) => ['channels', handle, 'videos'] as const,
   playlistVideos: (id: string) => ['playlists', id, 'videos'] as const,
   recentVideos: ['videos', 'recent'] as const,
@@ -62,6 +69,22 @@ export function usePlaylists(): UseQueryResult<PlaylistListItem[], Error> {
     queryKey: queryKeys.playlists,
     queryFn: fetchPlaylists,
     refetchInterval: LIBRARY_INTERVAL_MS,
+  })
+}
+
+export function useCategories(): UseQueryResult<CategoryList, Error> {
+  return useQuery({
+    queryKey: queryKeys.categories,
+    queryFn: listCategories,
+    refetchInterval: LIBRARY_INTERVAL_MS,
+  })
+}
+
+export function useCategoryVideos(id: string): UseQueryResult<HomeVideo[], Error> {
+  return useQuery({
+    queryKey: queryKeys.categoryVideos(id),
+    queryFn: () => listCategoryVideos(id),
+    refetchInterval: LIVE_INTERVAL_MS,
   })
 }
 
@@ -148,8 +171,8 @@ export function useVersion(): UseQueryResult<AppVersion, Error> {
 }
 
 /**
- * Returns a function that refetches the channel and playlist lists (and,
- * by prefix, their video lists) after an action that changed them.
+ * Returns a function that refetches the channel, playlist and category lists
+ * (and, by prefix, their video lists) after an action that changed them.
  */
 export function useInvalidateLibrary(): () => Promise<unknown> {
   const queryClient = useQueryClient()
@@ -158,6 +181,7 @@ export function useInvalidateLibrary(): () => Promise<unknown> {
       Promise.all([
         queryClient.invalidateQueries({ queryKey: queryKeys.channels }),
         queryClient.invalidateQueries({ queryKey: queryKeys.playlists }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.categories }),
       ]),
     [queryClient],
   )
@@ -197,6 +221,21 @@ export function useMarkVideoWatched(): (youtubeId: string) => Promise<void> {
   return useCallback(
     async (youtubeId: string) => {
       await markVideoWatched(youtubeId)
+      await invalidateLibraryAndHome()
+    },
+    [invalidateLibraryAndHome],
+  )
+}
+
+/**
+ * Returns a function that marks every downloaded video of a category watched,
+ * then refetches the library (category videos included) and the home videos.
+ */
+export function useMarkCategoryWatched(): (id: string) => Promise<void> {
+  const invalidateLibraryAndHome = useInvalidateLibraryAndHome()
+  return useCallback(
+    async (id: string) => {
+      await markCategoryWatched(id)
       await invalidateLibraryAndHome()
     },
     [invalidateLibraryAndHome],

@@ -4,8 +4,10 @@ import { Home } from './components/Home'
 import { PlaylistDetail } from './components/PlaylistDetail'
 import { ChannelDetail } from './components/ChannelDetail'
 import { TasksView } from './components/TasksView'
+import { CategoryDetail } from './components/CategoryDetail'
 import { AddChannelDialog } from './components/AddChannelDialog'
 import { AddPlaylistDialog } from './components/AddPlaylistDialog'
+import { AddCategoryDialog } from './components/AddCategoryDialog'
 import { SIDEBAR_ID, Sidebar } from './components/Sidebar'
 import { SettingsMenu } from './components/SettingsMenu'
 import { AnnouncementBar } from './components/AnnouncementBar'
@@ -22,7 +24,7 @@ export default function App() {
 
 /** The routed layout; split from `App` so tests can render it in a memory router. */
 export function AppShell() {
-  const [addDialog, setAddDialog] = useState<'channel' | 'playlist' | null>(null)
+  const [addDialog, setAddDialog] = useState<'channel' | 'playlist' | 'category' | null>(null)
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const closeSidebar = () => setSidebarOpen(false)
   // The mobile sidebar opens right below the header, wherever it sits: an
@@ -85,6 +87,7 @@ export function AppShell() {
           onClose={closeSidebar}
           onAddChannel={() => setAddDialog('channel')}
           onAddPlaylist={() => setAddDialog('playlist')}
+          onAddCategory={() => setAddDialog('category')}
         />
         <main className="min-w-0 flex-1 md:min-h-0 md:overflow-y-auto">
           <div className="h-full px-4 pt-4 pb-6 sm:px-6 md:pt-6">
@@ -93,6 +96,7 @@ export function AppShell() {
               <Route path="/playlists/:id" element={<PlaylistDetail />} />
               <Route path="/channels/:id" element={<ChannelDetail />} />
               <Route path="/tasks" element={<TasksView />} />
+              <Route path="/categories/:id" element={<CategoryDetail />} />
             </Routes>
           </div>
         </main>
@@ -103,6 +107,10 @@ export function AppShell() {
       />
       <AddPlaylistDialog
         open={addDialog === 'playlist'}
+        onOpenChange={(open) => !open && setAddDialog(null)}
+      />
+      <AddCategoryDialog
+        open={addDialog === 'category'}
         onOpenChange={(open) => !open && setAddDialog(null)}
       />
     </div>

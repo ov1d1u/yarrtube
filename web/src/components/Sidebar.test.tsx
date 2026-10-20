@@ -2,12 +2,21 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { Sidebar } from './Sidebar'
-import { aChannel, aPlaylist, mockApi, renderWithProviders, type Routes } from '@/test/helpers'
+import {
+  aCategoryList,
+  aChannel,
+  aPlaylist,
+  mockApi,
+  renderWithProviders,
+  type Routes,
+} from '@/test/helpers'
 
 function renderSidebar(routes: Routes, { route = '/' } = {}) {
   mockApi(routes)
   return renderWithProviders(
-    <Sidebar open onClose={() => {}} onAddChannel={() => {}} onAddPlaylist={() => {}} />,
+    <Sidebar open onClose={() => {}} onAddChannel={() => {}} onAddPlaylist={() => {}}
+      onAddCategory={() => {}}
+    />,
     { route },
   )
 }
@@ -21,6 +30,7 @@ describe('Sidebar', () => {
     renderSidebar({
       'GET /api/channels': [aChannel({ name: 'Chan A', unwatched_count: 3 })],
       'GET /api/playlists': [aPlaylist({ name: 'List B' })],
+      'GET /api/categories': aCategoryList(),
     })
 
     expect(await screen.findByText('Chan A')).toBeInTheDocument()
@@ -35,6 +45,7 @@ describe('Sidebar', () => {
         aChannel({ name: 'Busy', unwatched_count: 5 }),
       ],
       'GET /api/playlists': [],
+      'GET /api/categories': aCategoryList(),
     })
 
     await screen.findByText('Busy')
@@ -46,21 +57,177 @@ describe('Sidebar', () => {
     expect(busyIndex).toBeLessThan(behindIndex)
   })
 
-  it('collapses long caught-up sections behind a "show more" toggle', async () => {
-    const channels = Array.from({ length: 8 }, (_, index) =>
-      aChannel({ name: `Channel ${String.fromCharCode(65 + index)}`, unwatched_count: 0 }),
+  it('lists every channel of an unfolded section with no show-more control', async () => {
+    const channels = Array.from({ length: 40 }, (_, index) =>
+      aChannel({ name: `Chan ${index}`, unwatched_count: 0 }),
     )
     renderSidebar({ 'GET /api/channels': channels, 'GET /api/playlists': [] })
 
-    await screen.findByText('Channel A')
+    await screen.findByText('Chan 0')
 
-    // Five caught-up channels lead; the other three hide behind the toggle.
-    expect(screen.queryByText('Channel F')).not.toBeInTheDocument()
+    expect(
+      channels.filter((channel) => screen.queryByText(channel.name) === null),
+    ).toEqual([])
+    expect(screen.queryByRole('button', { name: /^Show / })).not.toBeInTheDocument()
+  })
+
+  it('offers a labelled add row in an empty section and a heading + once it has items', async () => {
+    renderSidebar({
+      'GET /api/channels': [],
+      'GET /api/playlists': [aPlaylist({ name: 'List B' })],
+      'GET /api/categories': aCategoryList(),
+    })
+
+    await screen.findByText('List B')
+
+    expect(await screen.findByRole('button', { name: 'Add category' })).toHaveTextContent(
+      'Add category',
+    )
+    expect(screen.getByRole('button', { name: 'Add channel' })).toHaveTextContent('Add channel')
+    expect(screen.getByRole('button', { name: 'Add playlist' })).toHaveTextContent('')
+    expect(screen.getByRole('button', { name: 'Add playlist' })).toHaveAttribute(
+      'title',
+      'Add playlist',
+    )
+  })
+
+  it('folds a section from its heading, hiding its rows and add control', async () => {
+    renderSidebar({
+      'GET /api/channels': [aChannel({ name: 'Chan A' })],
+      'GET /api/playlists': [],
+      'GET /api/categories': aCategoryList(),
+    })
+
+    await screen.findByText('Chan A')
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Channels' }))
+
+    expect(screen.getByRole('heading', { name: 'Channels' })).toBeInTheDocument()
+    expect(screen.queryByText('Chan A')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Add channel' })).not.toBeInTheDocument()
+  })
+
+  it('unfolds a folded section', async () => {
+    renderSidebar({
+      'GET /api/channels': [aChannel({ name: 'Chan A' })],
+      'GET /api/playlists': [],
+      'GET /api/categories': aCategoryList(),
+    })
+
+    await screen.findByText('Chan A')
     const user = userEvent.setup()
-    await user.click(screen.getByRole('button', { name: 'Show 3 more' }))
-    expect(screen.getByText('Channel F')).toBeInTheDocument()
-    await user.click(screen.getByRole('button', { name: 'Show less' }))
-    expect(screen.queryByText('Channel F')).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Channels' }))
+    await user.click(screen.getByRole('button', { name: 'Channels' }))
+
+    expect(screen.getByText('Chan A')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Add channel' })).toBeInTheDocument()
+  })
+
+  it('folds sections independently', async () => {
+    renderSidebar({
+      'GET /api/channels': [aChannel({ name: 'Chan A' })],
+      'GET /api/playlists': [aPlaylist({ name: 'List B' })],
+      'GET /api/categories': aCategoryList(),
+    })
+
+    await screen.findByText('Chan A')
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Channels' }))
+
+    expect(await screen.findByText('List B')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Add playlist' })).toBeInTheDocument()
+  })
+
+  it('exposes the fold state on the heading control', async () => {
+    renderSidebar({ 'GET /api/channels': [], 'GET /api/playlists': [] })
+
+    const heading = await screen.findByRole('button', { name: 'Channels' })
+    const unfolded = heading.getAttribute('aria-expanded')
+    await userEvent.setup().click(heading)
+
+    expect([unfolded, heading.getAttribute('aria-expanded')]).toEqual(['true', 'false'])
+  })
+
+  it('remembers a folded section across remounts', async () => {
+    const routes = {
+      'GET /api/channels': [aChannel({ name: 'Chan A' })],
+      'GET /api/playlists': [aPlaylist({ name: 'List B' })],
+      'GET /api/categories': aCategoryList(),
+    }
+    const { unmount } = renderSidebar(routes)
+    await screen.findByText('Chan A')
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Playlists' }))
+    unmount()
+
+    renderSidebar(routes)
+
+    expect(await screen.findByText('Chan A')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Playlists' })).toHaveAttribute(
+      'aria-expanded',
+      'false',
+    )
+    expect(screen.queryByText('List B')).not.toBeInTheDocument()
+  })
+
+  it("shows the channels' unwatched total badge only while folded and above 0", async () => {
+    const { unmount } = renderSidebar({
+      'GET /api/channels': [
+        aChannel({ name: 'Chan A', unwatched_count: 3 }),
+        aChannel({ name: 'Chan B', unwatched_count: 0 }),
+        aChannel({ name: 'Chan C', unwatched_count: 20 }),
+      ],
+      'GET /api/playlists': [],
+      'GET /api/categories': aCategoryList(),
+    })
+    await screen.findByText('Chan A')
+    const totalWhileUnfolded = screen.queryByLabelText('23 unwatched')
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Channels' }))
+    const totalWhileFolded = screen.queryByLabelText('23 unwatched')?.textContent
+    unmount()
+
+    renderSidebar({
+      'GET /api/channels': [aChannel({ name: 'Chan A', unwatched_count: 0 })],
+      'GET /api/playlists': [],
+      'GET /api/categories': aCategoryList(),
+    })
+    const caughtUpHeading = await screen.findByRole('button', { name: 'Channels' })
+
+    expect([totalWhileUnfolded, totalWhileFolded]).toEqual([null, '23'])
+    expect(caughtUpHeading).toHaveAttribute('aria-expanded', 'false')
+    expect(caughtUpHeading).toHaveTextContent(/^Channels$/)
+  })
+
+  it('shows no total on a folded Playlists heading', async () => {
+    renderSidebar({
+      'GET /api/channels': [],
+      'GET /api/playlists': [aPlaylist({ name: 'List B' })],
+      'GET /api/categories': aCategoryList(),
+    })
+
+    await screen.findByText('List B')
+    const heading = screen.getByRole('button', { name: 'Playlists' })
+    await userEvent.setup().click(heading)
+
+    expect(heading).toHaveAttribute('aria-expanded', 'false')
+    expect(heading).toHaveTextContent(/^Playlists$/)
+  })
+
+  it("keeps a folded section folded and marks its heading active on that section's detail route", async () => {
+    renderSidebar(
+      {
+        'GET /api/channels': [aChannel({ id: 'chan', name: 'Chan A' })],
+        'GET /api/playlists': [aPlaylist({ name: 'List B' })],
+        'GET /api/categories': aCategoryList(),
+      },
+      { route: '/channels/chan' },
+    )
+
+    await screen.findByText('Chan A')
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Channels' }))
+    const channelsHeading = screen.getByRole('button', { name: 'Channels' })
+
+    expect(channelsHeading).toHaveAttribute('aria-expanded', 'false')
+    expect(channelsHeading).toHaveAttribute('aria-current', 'true')
+    expect(screen.queryByText('Chan A')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Playlists' })).not.toHaveAttribute('aria-current')
   })
 
   it('offers search only above the threshold and filters both sections', async () => {
@@ -78,6 +245,28 @@ describe('Sidebar', () => {
     expect(screen.queryByText('Chan 3')).not.toBeInTheDocument()
     // The channels section disappears entirely once nothing in it matches.
     expect(screen.queryByText('Channels')).not.toBeInTheDocument()
+  })
+
+  it('shows matches of a folded section while searching, and folds it again when cleared', async () => {
+    const channels = [
+      aChannel({ name: 'Veritasium' }),
+      ...Array.from({ length: 15 }, (_, index) => aChannel({ name: `Chan ${index}` })),
+    ]
+    renderSidebar({ 'GET /api/channels': channels, 'GET /api/playlists': [] })
+
+    const search = await screen.findByRole('searchbox', { name: 'Search channels and playlists' })
+    const user = userEvent.setup()
+    await user.click(screen.getByRole('button', { name: 'Channels' }))
+    await user.type(search, 'ver')
+    const matchWhileSearching = screen.queryByText('Veritasium')?.textContent
+    await user.clear(search)
+
+    expect(matchWhileSearching).toBe('Veritasium')
+    expect(screen.queryByText('Veritasium')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Channels' })).toHaveAttribute(
+      'aria-expanded',
+      'false',
+    )
   })
 
   it('says when nothing matches the search', async () => {
@@ -101,6 +290,7 @@ describe('Sidebar', () => {
     renderSidebar({
       'GET /api/channels': { status: 500, error: 'boom' },
       'GET /api/playlists': [],
+      'GET /api/categories': aCategoryList(),
     })
 
     expect(await screen.findByText('Failed to load: boom')).toBeInTheDocument()
@@ -112,6 +302,7 @@ describe('Sidebar', () => {
     renderSidebar({
       'GET /api/channels': [],
       'GET /api/playlists': () => playlistRows,
+      'GET /api/categories': aCategoryList(),
       [`DELETE /api/playlists/${playlist.id}`]: () => {
         playlistRows = []
         return null
@@ -135,6 +326,7 @@ describe('Sidebar', () => {
     renderSidebar({
       'GET /api/channels': [channel],
       'GET /api/playlists': [],
+      'GET /api/categories': aCategoryList(),
       [`POST /api/channels/${channel.id}/reconcile`]: reconcile,
     })
 
@@ -151,6 +343,7 @@ describe('Sidebar', () => {
     renderSidebar({
       'GET /api/channels': [channel],
       'GET /api/playlists': [],
+      'GET /api/categories': aCategoryList(),
       [`POST /api/channels/${channel.id}/watched`]: markWatched,
     })
 
@@ -165,6 +358,7 @@ describe('Sidebar', () => {
     renderSidebar({
       'GET /api/channels': [],
       'GET /api/playlists': [aPlaylist({ name: 'List B' })],
+      'GET /api/categories': aCategoryList(),
     })
 
     const user = userEvent.setup()
@@ -184,10 +378,13 @@ describe('Sidebar', () => {
     const fetchMock = mockApi({
       'GET /api/channels': [],
       'GET /api/playlists': () => [playlist],
+      'GET /api/categories': aCategoryList(),
       'PATCH /api/playlists/PL1': update,
     })
     renderWithProviders(
-      <Sidebar open onClose={() => {}} onAddChannel={() => {}} onAddPlaylist={() => {}} />,
+      <Sidebar open onClose={() => {}} onAddChannel={() => {}} onAddPlaylist={() => {}}
+      onAddCategory={() => {}}
+    />,
     )
 
     const user = userEvent.setup()
@@ -219,10 +416,13 @@ describe('Sidebar', () => {
     const fetchMock = mockApi({
       'GET /api/channels': [],
       'GET /api/playlists': () => [playlist],
+      'GET /api/categories': aCategoryList(),
       'PATCH /api/playlists/PL1': update,
     })
     renderWithProviders(
-      <Sidebar open onClose={() => {}} onAddChannel={() => {}} onAddPlaylist={() => {}} />,
+      <Sidebar open onClose={() => {}} onAddChannel={() => {}} onAddPlaylist={() => {}}
+      onAddCategory={() => {}}
+    />,
     )
 
     const user = userEvent.setup()
@@ -247,10 +447,13 @@ describe('Sidebar', () => {
     const fetchMock = mockApi({
       'GET /api/channels': [],
       'GET /api/playlists': () => [playlist],
+      'GET /api/categories': aCategoryList(),
       'PATCH /api/playlists/PL1': update,
     })
     renderWithProviders(
-      <Sidebar open onClose={() => {}} onAddChannel={() => {}} onAddPlaylist={() => {}} />,
+      <Sidebar open onClose={() => {}} onAddChannel={() => {}} onAddPlaylist={() => {}}
+      onAddCategory={() => {}}
+    />,
     )
 
     const user = userEvent.setup()
@@ -270,6 +473,7 @@ describe('Sidebar', () => {
     renderSidebar({
       'GET /api/channels': [aChannel({ name: 'Chan A' })],
       'GET /api/playlists': [],
+      'GET /api/categories': aCategoryList(),
     })
 
     const user = userEvent.setup()
@@ -294,10 +498,13 @@ describe('Sidebar', () => {
     const fetchMock = mockApi({
       'GET /api/channels': () => [channel],
       'GET /api/playlists': [],
+      'GET /api/categories': aCategoryList(),
       'PATCH /api/channels/chan': update,
     })
     renderWithProviders(
-      <Sidebar open onClose={() => {}} onAddChannel={() => {}} onAddPlaylist={() => {}} />,
+      <Sidebar open onClose={() => {}} onAddChannel={() => {}} onAddPlaylist={() => {}}
+      onAddCategory={() => {}}
+    />,
     )
 
     const user = userEvent.setup()
@@ -324,6 +531,7 @@ describe('Sidebar', () => {
     mockApi({
       'GET /api/channels': [aChannel({ id: 'chan', name: 'Chan A', video_limit: 5 })],
       'GET /api/playlists': [],
+      'GET /api/categories': aCategoryList(),
       'PATCH /api/channels/chan': aChannel({
         id: 'chan',
         name: 'Chan A',
@@ -332,7 +540,9 @@ describe('Sidebar', () => {
       'POST /api/channels/chan/reconcile': reconcile,
     })
     renderWithProviders(
-      <Sidebar open onClose={() => {}} onAddChannel={() => {}} onAddPlaylist={() => {}} />,
+      <Sidebar open onClose={() => {}} onAddChannel={() => {}} onAddPlaylist={() => {}}
+      onAddCategory={() => {}}
+    />,
     )
 
     const user = userEvent.setup()
@@ -355,6 +565,7 @@ describe('Sidebar', () => {
     renderSidebar({
       'GET /api/channels': [],
       'GET /api/playlists': [aPlaylist({ id: 'PL1', name: 'Bluey' })],
+      'GET /api/categories': aCategoryList(),
       'PATCH /api/playlists/PL1': { status: 500, error: 'database is locked' },
     })
 
@@ -372,10 +583,16 @@ describe('Sidebar', () => {
   })
 
   it('closes when Escape is pressed while open', async () => {
-    mockApi({ 'GET /api/channels': [], 'GET /api/playlists': [] })
+    mockApi({
+      'GET /api/channels': [],
+      'GET /api/playlists': [],
+      'GET /api/categories': aCategoryList(),
+    })
     const onClose = vi.fn()
     renderWithProviders(
-      <Sidebar open onClose={onClose} onAddChannel={() => {}} onAddPlaylist={() => {}} />,
+      <Sidebar open onClose={onClose} onAddChannel={() => {}} onAddPlaylist={() => {}}
+      onAddCategory={() => {}}
+    />,
     )
 
     const user = userEvent.setup()

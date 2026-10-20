@@ -20,99 +20,25 @@ import {
 } from '@/api/client'
 import type { LibraryItem } from '@/api/types'
 import {
-  CAUGHT_UP_PREVIEW,
   SEARCH_THRESHOLD,
-  channelLeadCount,
-  collapse,
-  matchesSearch,
+  activeIdFrom,
   orderChannels,
+  sectionView,
+  unwatchedTotal,
 } from '@/lib/sidebarSections'
 import { ConfirmDialog } from './ConfirmDialog'
 import { EditChannelDialog } from './EditChannelDialog'
 import { EditPlaylistDialog } from './EditPlaylistDialog'
 import { EntryActionsMenu } from './EntryActionsMenu'
+import { SidebarCategories } from './SidebarCategories'
+import { SidebarSectionHeading } from './SidebarSectionHeading'
 import { Thumbnail } from './Thumbnail'
 import { DropdownMenuItem } from '@/components/ui/dropdown-menu'
 import { Input } from '@/components/ui/input'
+import { useRememberedFlag } from '@/hooks/useRememberedFlag'
 import { useSaveChannelSettings } from '@/hooks/useSaveChannelSettings'
 import { errorMessage } from '@/lib/errorMessage'
 import { cn } from '@/lib/utils'
-
-function activeIdFrom(pathname: string, prefix: string): string | null {
-  if (!pathname.startsWith(prefix)) {
-    return null
-  }
-  const rest = pathname.slice(prefix.length).split('/')[0]
-  return rest ? decodeURIComponent(rest) : null
-}
-
-/**
- * Whether a sidebar section is expanded, remembered per browser. Storage may
- * be unavailable (private mode, blocked site data): the section then starts
- * collapsed and the choice lasts until reload.
- */
-function useExpandedState(section: string): readonly [boolean, () => void] {
-  const key = `yarrtube.sidebar.expanded.${section}`
-  const [expanded, setExpanded] = useState(() => {
-    try {
-      return window.localStorage.getItem(key) === 'true'
-    } catch {
-      return false
-    }
-  })
-
-  const toggle = () => {
-    const next = !expanded
-    setExpanded(next)
-    try {
-      window.localStorage.setItem(key, String(next))
-    } catch {
-      // Not remembered; the in-memory state still applies.
-    }
-  }
-
-  return [expanded, toggle] as const
-}
-
-interface SectionViewOptions {
-  searchText: string
-  expanded: boolean
-  leadCount: number
-  activeId: string | null
-}
-
-interface SectionView {
-  rows: LibraryItem[] | undefined
-  hiddenCount: number
-  collapsible: boolean
-}
-
-/**
- * The rows a section shows: every match while searching, otherwise all rows
- * when expanded or its leading rows (plus the active one) when collapsed.
- * `collapsible` says whether collapsing would hide anything.
- */
-function sectionView(
-  items: LibraryItem[] | undefined,
-  { searchText, expanded, leadCount, activeId }: SectionViewOptions,
-): SectionView {
-  if (!items) {
-    return { rows: items, hiddenCount: 0, collapsible: false }
-  }
-  if (searchText) {
-    return {
-      rows: items.filter((item) => matchesSearch(item, searchText)),
-      hiddenCount: 0,
-      collapsible: false,
-    }
-  }
-  const collapsed = collapse(items, leadCount, activeId)
-  return {
-    rows: expanded ? items : collapsed.shown,
-    hiddenCount: expanded ? 0 : collapsed.hiddenCount,
-    collapsible: collapsed.hiddenCount > 0,
-  }
-}
 
 interface SidebarRowMenuProps {
   item: LibraryItem
@@ -235,10 +161,11 @@ interface SidebarSectionProps {
   onAdd: () => void
   onClose: () => void
   items: LibraryItem[] | undefined
-  hiddenCount: number
-  expanded: boolean
-  collapsible: boolean
-  onToggleExpanded: () => void
+  folded: boolean
+  headingActive: boolean
+  onToggleFolded: () => void
+  /** Channels only; omitted for Playlists. Shown when folded and > 0. */
+  foldedTotal?: number | undefined
   error: Error | null
   activeId: string | null
   hrefFor: (item: LibraryItem) => string
@@ -259,10 +186,10 @@ function SidebarSection({
   onAdd,
   onClose,
   items,
-  hiddenCount,
-  expanded,
-  collapsible,
-  onToggleExpanded,
+  folded,
+  headingActive,
+  onToggleFolded,
+  foldedTotal,
   error,
   activeId,
   hrefFor,
@@ -276,67 +203,73 @@ function SidebarSection({
   onNavigate,
 }: SidebarSectionProps) {
   const [pendingDelete, setPendingDelete] = useState<LibraryItem | null>(null)
+  // Closing first lets the mobile drawer get out of the dialog's way;
+  // on desktop the sidebar is static and `onClose` changes nothing.
+  const add = () => {
+    onClose()
+    onAdd()
+  }
+  // An empty section gets a full-width add row; otherwise a compact `+` on the heading.
+  const empty = !error && items?.length === 0
 
   return (
     <div>
-      <h3 className="mb-2 px-2 font-heading text-base font-semibold tracking-tight text-foreground">
-        {title}
-      </h3>
-      {/* Closing first lets the mobile drawer get out of the dialog's way;
-          on desktop the sidebar is static and `onClose` changes nothing. */}
-      <button
-        type="button"
-        className="mb-1 flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-sm text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
-        onClick={() => {
-          onClose()
-          onAdd()
-        }}
-      >
-        <Plus className="size-4 shrink-0" />
-        {addLabel}
-      </button>
-      {error && <p className="px-2 text-sm text-destructive">Failed to load: {error.message}</p>}
-      {!error && !items && <p className="px-2 text-sm text-muted-foreground">Loading…</p>}
-      {!error && items && items.length === 0 && (
-        <p className="px-2 text-sm text-muted-foreground">None tracked yet.</p>
-      )}
-      {!error && items && items.length > 0 && (
-        <ul className="flex flex-col">
-          {items.map((item) => (
-            <SidebarRow
-              key={item.id}
-              item={item}
-              active={item.id === activeId}
-              href={hrefFor(item)}
-              showAvatar={showAvatar}
-              onNavigate={onNavigate}
-              onSync={async () => {
-                try {
-                  await onSync(item.id)
-                } catch (err) {
-                  window.alert(`Failed to sync "${item.name}": ${errorMessage(err)}`)
-                }
-              }}
-              onMarkWatched={onMarkWatched && (() => onMarkWatched(item.id))}
-              onSetExcludedFromHome={
-                onSetExcludedFromHome &&
-                ((excluded: boolean) => onSetExcludedFromHome(item.id, excluded))
-              }
-              onEditRequest={onEditRequest && (() => onEditRequest(item.id))}
-              onDeleteRequest={() => setPendingDelete(item)}
-            />
-          ))}
-        </ul>
-      )}
-      {!error && collapsible && (
-        <button
-          type="button"
-          className="mt-1 px-2 py-1 text-xs text-muted-foreground transition-colors hover:text-foreground"
-          aria-expanded={expanded}
-          onClick={onToggleExpanded}
-        >
-          {expanded ? 'Show less' : `Show ${hiddenCount} more`}
-        </button>
+      <SidebarSectionHeading
+        title={title}
+        folded={folded}
+        onToggleFolded={onToggleFolded}
+        headingActive={headingActive}
+        foldedTotal={foldedTotal}
+        add={empty ? undefined : { label: addLabel, onClick: add }}
+      />
+      {!folded && (
+        <>
+          {empty && (
+            <button
+              type="button"
+              className="mb-1 flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-sm text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+              onClick={add}
+            >
+              <Plus className="size-4 shrink-0" />
+              {addLabel}
+            </button>
+          )}
+          {error && (
+            <p className="px-2 text-sm text-destructive">Failed to load: {error.message}</p>
+          )}
+          {!error && !items && <p className="px-2 text-sm text-muted-foreground">Loading…</p>}
+          {!error && items && items.length === 0 && (
+            <p className="px-2 text-sm text-muted-foreground">None tracked yet.</p>
+          )}
+          {!error && items && items.length > 0 && (
+            <ul className="flex flex-col">
+              {items.map((item) => (
+                <SidebarRow
+                  key={item.id}
+                  item={item}
+                  active={item.id === activeId}
+                  href={hrefFor(item)}
+                  showAvatar={showAvatar}
+                  onNavigate={onNavigate}
+                  onSync={async () => {
+                    try {
+                      await onSync(item.id)
+                    } catch (err) {
+                      window.alert(`Failed to sync "${item.name}": ${errorMessage(err)}`)
+                    }
+                  }}
+                  onMarkWatched={onMarkWatched && (() => onMarkWatched(item.id))}
+                  onSetExcludedFromHome={
+                    onSetExcludedFromHome &&
+                    ((excluded: boolean) => onSetExcludedFromHome(item.id, excluded))
+                  }
+                  onEditRequest={onEditRequest && (() => onEditRequest(item.id))}
+                  onDeleteRequest={() => setPendingDelete(item)}
+                />
+              ))}
+            </ul>
+          )}
+        </>
       )}
 
       <ConfirmDialog
@@ -367,6 +300,7 @@ interface SidebarProps {
   onClose: () => void
   onAddChannel: () => void
   onAddPlaylist: () => void
+  onAddCategory: () => void
 }
 
 export function Sidebar({
@@ -375,6 +309,7 @@ export function Sidebar({
   onClose,
   onAddChannel,
   onAddPlaylist,
+  onAddCategory,
 }: SidebarProps) {
   const location = useLocation()
   const navigate = useNavigate()
@@ -391,8 +326,14 @@ export function Sidebar({
   const editingPlaylist =
     playlists?.find((playlist) => playlist.id === editingPlaylistId) ?? null
   const [search, setSearch] = useState('')
-  const [channelsExpanded, toggleChannelsExpanded] = useExpandedState('channels')
-  const [playlistsExpanded, togglePlaylistsExpanded] = useExpandedState('playlists')
+  const [channelsFolded, toggleChannelsFolded] = useRememberedFlag(
+    'yarrtube.sidebar.folded.channels',
+    false,
+  )
+  const [playlistsFolded, togglePlaylistsFolded] = useRememberedFlag(
+    'yarrtube.sidebar.folded.playlists',
+    false,
+  )
 
   // The drawer scrolls on its own; keep the page behind it still.
   useEffect(() => {
@@ -430,14 +371,12 @@ export function Sidebar({
   const orderedChannels = channels && orderChannels(channels)
   const channelsView = sectionView(orderedChannels, {
     searchText,
-    expanded: channelsExpanded,
-    leadCount: orderedChannels ? channelLeadCount(orderedChannels) : 0,
+    folded: channelsFolded,
     activeId: activeChannelId,
   })
   const playlistsView = sectionView(playlists, {
     searchText,
-    expanded: playlistsExpanded,
-    leadCount: CAUGHT_UP_PREVIEW,
+    folded: playlistsFolded,
     activeId: activePlaylistId,
   })
   const showChannels = !searchText || channelsView.rows?.length !== 0
@@ -462,6 +401,7 @@ export function Sidebar({
           'md:static md:z-auto md:h-full md:w-60 md:max-w-none md:translate-x-0 md:shadow-none md:transition-none md:py-6',
         )}
       >
+        <SidebarCategories onAddCategory={onAddCategory} onClose={onClose} />
         {searchable && (
           <Input
             type="search"
@@ -481,10 +421,10 @@ export function Sidebar({
             onAdd={onAddChannel}
             onClose={onClose}
             items={channelsView.rows}
-            hiddenCount={channelsView.hiddenCount}
-            expanded={channelsExpanded}
-            collapsible={channelsView.collapsible}
-            onToggleExpanded={toggleChannelsExpanded}
+            folded={channelsView.folded}
+            headingActive={channelsView.headingActive}
+            onToggleFolded={toggleChannelsFolded}
+            foldedTotal={channels && unwatchedTotal(channels)}
             error={channelsError}
             activeId={activeChannelId}
             hrefFor={(channel) => `/channels/${channel.id}`}
@@ -510,10 +450,9 @@ export function Sidebar({
             onAdd={onAddPlaylist}
             onClose={onClose}
             items={playlistsView.rows}
-            hiddenCount={playlistsView.hiddenCount}
-            expanded={playlistsExpanded}
-            collapsible={playlistsView.collapsible}
-            onToggleExpanded={togglePlaylistsExpanded}
+            folded={playlistsView.folded}
+            headingActive={playlistsView.headingActive}
+            onToggleFolded={togglePlaylistsFolded}
             error={playlistsError}
             activeId={activePlaylistId}
             hrefFor={(playlist) => `/playlists/${playlist.id}`}
