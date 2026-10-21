@@ -54,7 +54,7 @@ impl PlaylistRepository for SqlitePlaylistRepository {
     fn insert(&self, playlist: &Playlist) -> anyhow::Result<()> {
         let conn = self.db.write()?;
         conn.execute(
-            "INSERT INTO playlists (id, name, path, quality, kind, exclude_from_home, created_at, last_episode, reconcile_interval_minutes) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO playlists (id, name, path, quality, kind, exclude_from_home, created_at, last_episode, reconcile_interval_minutes, hide_unwatched_count) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 playlist.id.as_str(),
                 playlist.name.as_str(),
@@ -64,7 +64,8 @@ impl PlaylistRepository for SqlitePlaylistRepository {
                 playlist.exclude_from_home,
                 playlist.created_at.to_rfc3339(),
                 playlist.last_episode.map(|number| number.episode()),
-                playlist.reconcile_interval.minutes()
+                playlist.reconcile_interval.minutes(),
+                playlist.hide_unwatched_count,
             ],
         )
         .inspect_err(|e| tracing::error!(playlist_id = %playlist.id, error = %e, "failed to insert playlist"))
@@ -75,7 +76,7 @@ impl PlaylistRepository for SqlitePlaylistRepository {
     fn update(&self, playlist: &Playlist) -> anyhow::Result<()> {
         let conn = self.db.write()?;
         conn.execute(
-            "UPDATE playlists SET name = ?2, path = ?3, quality = ?4, kind = ?5, exclude_from_home = ?6, created_at = ?7, reconcile_interval_minutes = ?8 WHERE id = ?1",
+            "UPDATE playlists SET name = ?2, path = ?3, quality = ?4, kind = ?5, exclude_from_home = ?6, created_at = ?7, reconcile_interval_minutes = ?8, hide_unwatched_count = ?9 WHERE id = ?1",
             params![
                 playlist.id.as_str(),
                 playlist.name.as_str(),
@@ -85,6 +86,7 @@ impl PlaylistRepository for SqlitePlaylistRepository {
                 playlist.exclude_from_home,
                 playlist.created_at.to_rfc3339(),
                 playlist.reconcile_interval.minutes(),
+                playlist.hide_unwatched_count,
             ],
         )
         .inspect_err(|e| tracing::error!(playlist_id = %playlist.id, error = %e, "failed to update playlist"))
@@ -153,6 +155,7 @@ impl SqlitePlaylistRepository {
             created_at: row.get(6)?,
             last_episode: row.get(7)?,
             reconcile_interval: row.get(8)?,
+            hide_unwatched_count: row.get(9)?,
         })
     }
 
@@ -164,6 +167,7 @@ impl SqlitePlaylistRepository {
             quality: Quality::new(row.quality)?,
             kind: PlaylistKind::new(row.kind)?,
             exclude_from_home: row.exclude_from_home,
+            hide_unwatched_count: row.hide_unwatched_count,
             reconcile_interval: ReconcileInterval::new(row.reconcile_interval)?,
             created_at: DateTime::parse_from_rfc3339(&row.created_at)
                 .context("failed to parse stored created_at")?
@@ -176,7 +180,7 @@ impl SqlitePlaylistRepository {
     }
 }
 
-const PLAYLIST_COLUMNS: &str = "id, name, path, quality, kind, exclude_from_home, created_at, last_episode, reconcile_interval_minutes";
+const PLAYLIST_COLUMNS: &str = "id, name, path, quality, kind, exclude_from_home, created_at, last_episode, reconcile_interval_minutes, hide_unwatched_count";
 
 struct PlaylistRow {
     id: String,
@@ -188,6 +192,7 @@ struct PlaylistRow {
     created_at: String,
     last_episode: Option<u32>,
     reconcile_interval: i64,
+    hide_unwatched_count: bool,
 }
 
 #[cfg(test)]
@@ -251,6 +256,19 @@ mod tests {
             playlist("PL1", "First").with_reconcile_interval(ReconcileInterval::new(30).unwrap());
         repo.insert(&playlist).unwrap();
         let updated = playlist.with_reconcile_interval(ReconcileInterval::new(1440).unwrap());
+
+        repo.update(&updated).unwrap();
+
+        assert_eq!(repo.find(&updated.id).unwrap(), Some(updated));
+    }
+
+    #[test]
+    fn it_should_round_trip_the_playlists_hide_unwatched_count() {
+        let repo = repo();
+        let playlist = playlist("PL1", "First").with_hide_unwatched_count(true);
+        repo.insert(&playlist).unwrap();
+        assert_eq!(repo.find(&playlist.id).unwrap(), Some(playlist.clone()));
+        let updated = playlist.with_hide_unwatched_count(false);
 
         repo.update(&updated).unwrap();
 

@@ -133,10 +133,14 @@ export function previewChannel(channel: string): Promise<ChannelPreview> {
 /** Only the settings to change; an absent one keeps its stored value. */
 export interface UpdatePlaylistRequest {
   exclude_from_home?: boolean
+  hide_unwatched_count?: boolean
   reconcile_interval_minutes?: number
 }
 
-/** Changes whether a playlist's videos are left out of the home view and/or its reconcile interval. */
+/**
+ * Changes whether a playlist's videos are left out of the home view, whether
+ * its unwatched count is hidden and/or its reconcile interval.
+ */
 export function updatePlaylist(id: string, body: UpdatePlaylistRequest): Promise<PlaylistListItem> {
   return request(`/playlists/${encodeURIComponent(id)}`, {
     method: 'PATCH',
@@ -213,6 +217,13 @@ export async function markChannelWatched(handle: string): Promise<void> {
   await send(`/channels/${encodeURIComponent(handle)}/watched`, {
     method: 'POST',
     label: `mark channel ${handle} watched`,
+  })
+}
+
+export async function markPlaylistWatched(id: string): Promise<void> {
+  await send(`/playlists/${encodeURIComponent(id)}/watched`, {
+    method: 'POST',
+    label: `mark playlist ${id} watched`,
   })
 }
 

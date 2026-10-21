@@ -38,6 +38,20 @@ describe('Sidebar', () => {
     expect(screen.getByTitle('3 unwatched')).toHaveTextContent('3')
   })
 
+  it("shows a playlist's unwatched badge unless hidden", async () => {
+    renderSidebar({
+      'GET /api/channels': [],
+      'GET /api/playlists': [
+        aPlaylist({ name: 'Courses', unwatched_count: 2 }),
+        aPlaylist({ name: 'Music', unwatched_count: 40, hide_unwatched_count: true }),
+      ],
+    })
+
+    expect(await screen.findByText('Music')).toBeInTheDocument()
+    expect(screen.getByTitle('2 unwatched')).toHaveTextContent('2')
+    expect(screen.queryByTitle('40 unwatched')).not.toBeInTheDocument()
+  })
+
   it('orders channels by unwatched count', async () => {
     renderSidebar({
       'GET /api/channels': [
@@ -55,6 +69,24 @@ describe('Sidebar', () => {
     const behindIndex = names.findIndex((name) => name.includes('Barely Behind'))
     expect(busyIndex).toBeGreaterThanOrEqual(0)
     expect(busyIndex).toBeLessThan(behindIndex)
+  })
+
+  it('orders playlists by unwatched count', async () => {
+    renderSidebar({
+      'GET /api/channels': [],
+      'GET /api/playlists': [
+        aPlaylist({ name: 'Ambient', unwatched_count: 0 }),
+        aPlaylist({ name: 'Courses', unwatched_count: 2 }),
+        aPlaylist({ name: 'Music', unwatched_count: 40, hide_unwatched_count: true }),
+        aPlaylist({ name: 'watch later', unwatched_count: 7 }),
+      ],
+    })
+
+    await screen.findByText('Ambient')
+    // Row link text includes the unwatched badge, so strip the digits.
+    expect(
+      screen.getAllByRole('link').map((link) => (link.textContent ?? '').replace(/\d+$/, '')),
+    ).toEqual(['watch later', 'Courses', 'Ambient', 'Music'])
   })
 
   it('lists every channel of an unfolded section with no show-more control', async () => {
@@ -354,11 +386,31 @@ describe('Sidebar', () => {
     expect(markWatched).toHaveBeenCalledOnce()
   })
 
-  it('a playlist row menu offers no mark-all-watched item', async () => {
+  it('marks a playlist watched from its row menu', async () => {
+    let playlist = aPlaylist({ id: 'PL1', name: 'Courses', unwatched_count: 2 })
+    const markWatched = vi.fn(() => {
+      playlist = { ...playlist, unwatched_count: 0 }
+      return null
+    })
+    renderSidebar({
+      'GET /api/channels': [],
+      'GET /api/playlists': () => [playlist],
+      'GET /api/categories': aCategoryList(),
+      'POST /api/playlists/PL1/watched': markWatched,
+    })
+
+    const user = userEvent.setup()
+    await user.click(await screen.findByRole('button', { name: 'Actions for Courses' }))
+    await user.click(await screen.findByRole('menuitem', { name: 'Mark all watched' }))
+
+    expect(markWatched).toHaveBeenCalledOnce()
+    await waitFor(() => expect(screen.queryByTitle('2 unwatched')).not.toBeInTheDocument())
+  })
+
+  it('offers playlist row actions in order', async () => {
     renderSidebar({
       'GET /api/channels': [],
       'GET /api/playlists': [aPlaylist({ name: 'List B' })],
-      'GET /api/categories': aCategoryList(),
     })
 
     const user = userEvent.setup()
@@ -366,7 +418,14 @@ describe('Sidebar', () => {
 
     expect(
       (await screen.findAllByRole('menuitem')).map((item) => item.textContent),
-    ).toEqual(['Sync', 'Exclude from home', 'Edit settings', 'Delete'])
+    ).toEqual([
+      'Sync',
+      'Mark all watched',
+      'Exclude from home',
+      'Hide unwatched count',
+      'Edit settings',
+      'Delete',
+    ])
   })
 
   it("edits a playlist's settings from its row menu", async () => {
@@ -469,7 +528,43 @@ describe('Sidebar', () => {
     expect(await screen.findByRole('menuitem', { name: 'Exclude from home' })).toBeInTheDocument()
   })
 
-  it('a channel row menu offers no home item', async () => {
+  it("hides and shows a playlist's unwatched count from its row menu", async () => {
+    let playlist = aPlaylist({ id: 'PL1', name: 'Music', unwatched_count: 3 })
+    const update = vi.fn(() => {
+      playlist = { ...playlist, hide_unwatched_count: !playlist.hide_unwatched_count }
+      return playlist
+    })
+    const fetchMock = mockApi({
+      'GET /api/channels': [],
+      'GET /api/playlists': () => [playlist],
+      'GET /api/categories': aCategoryList(),
+      'PATCH /api/playlists/PL1': update,
+    })
+    renderWithProviders(
+      <Sidebar open onClose={() => {}} onAddChannel={() => {}} onAddPlaylist={() => {}}
+      onAddCategory={() => {}}
+    />,
+    )
+
+    const user = userEvent.setup()
+    await user.click(await screen.findByRole('button', { name: 'Actions for Music' }))
+    await user.click(await screen.findByRole('menuitem', { name: 'Hide unwatched count' }))
+
+    expect(update).toHaveBeenCalledOnce()
+    const patchCall = fetchMock.mock.calls.find(
+      ([, init]) => (init as RequestInit | undefined)?.method === 'PATCH',
+    ) as [string, RequestInit]
+    expect(JSON.parse(patchCall[1].body as string)).toEqual({ hide_unwatched_count: true })
+    await waitFor(() => expect(screen.queryByTitle('3 unwatched')).not.toBeInTheDocument())
+    await user.click(await screen.findByRole('button', { name: 'Actions for Music' }))
+    await user.click(await screen.findByRole('menuitem', { name: 'Show unwatched count' }))
+
+    expect(await screen.findByTitle('3 unwatched')).toBeInTheDocument()
+    await user.click(await screen.findByRole('button', { name: 'Actions for Music' }))
+    expect(await screen.findByRole('menuitem', { name: 'Hide unwatched count' })).toBeInTheDocument()
+  })
+
+  it('a channel row menu offers no home or unwatched count item', async () => {
     renderSidebar({
       'GET /api/channels': [aChannel({ name: 'Chan A' })],
       'GET /api/playlists': [],
@@ -580,6 +675,26 @@ describe('Sidebar', () => {
     )
     await user.click(await screen.findByRole('button', { name: 'Actions for Bluey' }))
     expect(await screen.findByRole('menuitem', { name: 'Exclude from home' })).toBeInTheDocument()
+  })
+
+  it("alerts when hiding a playlist's count fails", async () => {
+    const alert = vi.spyOn(window, 'alert').mockImplementation(() => {})
+    renderSidebar({
+      'GET /api/channels': [],
+      'GET /api/playlists': [aPlaylist({ id: 'PL1', name: 'Music', unwatched_count: 3 })],
+      'PATCH /api/playlists/PL1': { status: 500, error: 'database is locked' },
+    })
+
+    const user = userEvent.setup()
+    await user.click(await screen.findByRole('button', { name: 'Actions for Music' }))
+    await user.click(await screen.findByRole('menuitem', { name: 'Hide unwatched count' }))
+
+    await waitFor(() =>
+      expect(alert).toHaveBeenCalledWith(
+        'Failed to hide the unwatched count of "Music": database is locked',
+      ),
+    )
+    expect(screen.getByTitle('3 unwatched')).toBeInTheDocument()
   })
 
   it('closes when Escape is pressed while open', async () => {

@@ -8,6 +8,7 @@ import {
   usePlaylists,
   useRemoveQuery,
   useSetPlaylistExcludedFromHome,
+  useSetPlaylistUnwatchedCountHidden,
   useUpdatePlaylistSettings,
 } from '@/api/queries'
 import {
@@ -16,14 +17,16 @@ import {
   deleteChannel,
   deletePlaylist,
   markChannelWatched,
+  markPlaylistWatched,
   avatarMediaUrl,
 } from '@/api/client'
 import type { LibraryItem } from '@/api/types'
 import {
   SEARCH_THRESHOLD,
   activeIdFrom,
-  orderChannels,
+  orderByUnwatched,
   sectionView,
+  shownUnwatchedCount,
   unwatchedTotal,
 } from '@/lib/sidebarSections'
 import { ConfirmDialog } from './ConfirmDialog'
@@ -45,6 +48,7 @@ interface SidebarRowMenuProps {
   onSync: () => Promise<void>
   onMarkWatched?: (() => Promise<void>) | undefined
   onSetExcludedFromHome?: ((excluded: boolean) => Promise<void>) | undefined
+  onSetUnwatchedCountHidden?: ((hidden: boolean) => Promise<void>) | undefined
   onEditRequest?: (() => void) | undefined
   onDeleteRequest: () => void
 }
@@ -54,6 +58,7 @@ function SidebarRowMenu({
   onSync,
   onMarkWatched,
   onSetExcludedFromHome,
+  onSetUnwatchedCountHidden,
   onEditRequest,
   onDeleteRequest,
 }: SidebarRowMenuProps) {
@@ -84,6 +89,8 @@ function SidebarRowMenu({
       onMarkWatched={onMarkWatched}
       excludedFromHome={onSetExcludedFromHome && (item.exclude_from_home ?? false)}
       onSetExcludedFromHome={onSetExcludedFromHome}
+      unwatchedCountHidden={onSetUnwatchedCountHidden && (item.hide_unwatched_count ?? false)}
+      onSetUnwatchedCountHidden={onSetUnwatchedCountHidden}
       onEditRequest={onEditRequest}
       onDeleteRequest={onDeleteRequest}
     />
@@ -97,6 +104,7 @@ interface SidebarRowProps {
   onSync: () => Promise<void>
   onMarkWatched?: (() => Promise<void>) | undefined
   onSetExcludedFromHome?: ((excluded: boolean) => Promise<void>) | undefined
+  onSetUnwatchedCountHidden?: ((hidden: boolean) => Promise<void>) | undefined
   onEditRequest?: (() => void) | undefined
   onDeleteRequest: () => void
   showAvatar?: boolean | undefined
@@ -110,12 +118,13 @@ function SidebarRow({
   onSync,
   onMarkWatched,
   onSetExcludedFromHome,
+  onSetUnwatchedCountHidden,
   onEditRequest,
   onDeleteRequest,
   showAvatar,
   onNavigate,
 }: SidebarRowProps) {
-  const unwatchedCount = item.unwatched_count ?? 0
+  const unwatchedCount = shownUnwatchedCount(item)
   return (
     <li className={cn('flex items-center gap-1 rounded-md pr-1', active && 'bg-accent')}>
       <Link
@@ -148,6 +157,7 @@ function SidebarRow({
         onSync={onSync}
         onMarkWatched={onMarkWatched}
         onSetExcludedFromHome={onSetExcludedFromHome}
+        onSetUnwatchedCountHidden={onSetUnwatchedCountHidden}
         onEditRequest={onEditRequest}
         onDeleteRequest={onDeleteRequest}
       />
@@ -172,6 +182,7 @@ interface SidebarSectionProps {
   onSync: (id: string) => Promise<void>
   onMarkWatched?: (id: string) => Promise<void>
   onSetExcludedFromHome?: (id: string, excluded: boolean) => Promise<void>
+  onSetUnwatchedCountHidden?: (id: string, hidden: boolean) => Promise<void>
   /** Channels only: opens the edit channel dialog, which the caller owns. */
   onEditRequest?: (id: string) => void
   onDelete: (id: string) => Promise<void>
@@ -196,6 +207,7 @@ function SidebarSection({
   onSync,
   onMarkWatched,
   onSetExcludedFromHome,
+  onSetUnwatchedCountHidden,
   onEditRequest,
   onDelete,
   deleteDescription,
@@ -263,6 +275,10 @@ function SidebarSection({
                     onSetExcludedFromHome &&
                     ((excluded: boolean) => onSetExcludedFromHome(item.id, excluded))
                   }
+                  onSetUnwatchedCountHidden={
+                    onSetUnwatchedCountHidden &&
+                    ((hidden: boolean) => onSetUnwatchedCountHidden(item.id, hidden))
+                  }
                   onEditRequest={onEditRequest && (() => onEditRequest(item.id))}
                   onDeleteRequest={() => setPendingDelete(item)}
                 />
@@ -318,6 +334,7 @@ export function Sidebar({
   const refreshing = useLibraryAction()
   const removeQuery = useRemoveQuery()
   const setPlaylistExcludedFromHome = useSetPlaylistExcludedFromHome()
+  const setPlaylistUnwatchedCountHidden = useSetPlaylistUnwatchedCountHidden()
   const saveChannelSettings = useSaveChannelSettings()
   const [editingChannelId, setEditingChannelId] = useState<string | null>(null)
   const editingChannel = channels?.find((channel) => channel.id === editingChannelId) ?? null
@@ -368,13 +385,13 @@ export function Sidebar({
 
   const searchable = (channels?.length ?? 0) + (playlists?.length ?? 0) > SEARCH_THRESHOLD
   const searchText = searchable ? search.trim() : ''
-  const orderedChannels = channels && orderChannels(channels)
+  const orderedChannels = channels && orderByUnwatched(channels)
   const channelsView = sectionView(orderedChannels, {
     searchText,
     folded: channelsFolded,
     activeId: activeChannelId,
   })
-  const playlistsView = sectionView(playlists, {
+  const playlistsView = sectionView(playlists && orderByUnwatched(playlists), {
     searchText,
     folded: playlistsFolded,
     activeId: activePlaylistId,
@@ -458,7 +475,9 @@ export function Sidebar({
             hrefFor={(playlist) => `/playlists/${playlist.id}`}
             onNavigate={onClose}
             onSync={refreshing(reconcilePlaylist)}
+            onMarkWatched={refreshing(markPlaylistWatched)}
             onSetExcludedFromHome={setPlaylistExcludedFromHome}
+            onSetUnwatchedCountHidden={setPlaylistUnwatchedCountHidden}
             onEditRequest={setEditingPlaylistId}
             onDelete={refreshing(async (id: string) => {
               await deletePlaylist(id)

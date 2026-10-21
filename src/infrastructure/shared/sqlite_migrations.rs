@@ -17,6 +17,8 @@ const RECONCILE_INTERVAL_SQL: &str =
     include_str!("../../../migrations/0009_reconcile_interval.sql");
 const VIDEO_SUBTITLES_SQL: &str = include_str!("../../../migrations/0010_video_subtitles.sql");
 const CATEGORIES_SQL: &str = include_str!("../../../migrations/0011_categories.sql");
+const PLAYLIST_HIDE_UNWATCHED_COUNT_SQL: &str =
+    include_str!("../../../migrations/0012_playlist_hide_unwatched_count.sql");
 
 pub fn apply(conn: &mut Connection) -> anyhow::Result<()> {
     Migrations::new(vec![
@@ -31,6 +33,7 @@ pub fn apply(conn: &mut Connection) -> anyhow::Result<()> {
         M::up(RECONCILE_INTERVAL_SQL),
         M::up(VIDEO_SUBTITLES_SQL),
         M::up(CATEGORIES_SQL),
+        M::up(PLAYLIST_HIDE_UNWATCHED_COUNT_SQL),
     ])
     .to_latest(conn)
     .inspect_err(|e| tracing::error!(error = %e, "failed to apply database migrations"))
@@ -228,6 +231,40 @@ mod tests {
             |row| row.get::<_, i64>(0),
         );
         assert_eq!(exclude_from_home, Ok(0));
+    }
+
+    #[test]
+    fn it_should_default_existing_playlists_to_show_their_unwatched_count_when_migrating() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        Migrations::new(vec![
+            M::up(BASELINE_SQL),
+            M::up(WATCH_STATE_SQL),
+            M::up(PUBLISHED_AT_AND_SYNCED_AT_SQL),
+            M::up(LAST_ERRORED_AT_SQL),
+            M::up(LAST_PLAYED_AT_SQL),
+            M::up(PLAYLIST_VIDEO_POSITION_REQUIRED_SQL),
+            M::up(PLAYLIST_EXCLUDE_FROM_HOME_SQL),
+            M::up(EPISODE_NUMBERS_SQL),
+            M::up(RECONCILE_INTERVAL_SQL),
+            M::up(VIDEO_SUBTITLES_SQL),
+        ])
+        .to_latest(&mut conn)
+        .unwrap();
+        conn.execute(
+            "INSERT INTO playlists (id, name, path, quality, kind, created_at)
+             VALUES ('PL1', 'My Playlist', 'my-playlist', 'high', 'youtube_linked', '2024-01-01T00:00:00+00:00')",
+            [],
+        )
+        .unwrap();
+
+        apply(&mut conn).unwrap();
+
+        let hide_unwatched_count = conn.query_row(
+            "SELECT hide_unwatched_count FROM playlists WHERE id = 'PL1'",
+            [],
+            |row| row.get::<_, i64>(0),
+        );
+        assert_eq!(hide_unwatched_count, Ok(0));
     }
 
     #[test]

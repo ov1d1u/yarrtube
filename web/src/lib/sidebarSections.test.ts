@@ -1,8 +1,14 @@
 import { describe, expect, it } from 'vitest'
-import { matchesSearch, orderChannels, sectionView, unwatchedTotal } from './sidebarSections'
+import {
+  matchesSearch,
+  orderByUnwatched,
+  sectionView,
+  shownUnwatchedCount,
+  unwatchedTotal,
+} from './sidebarSections'
 import { aChannel, aPlaylist } from '@/test/helpers'
 
-describe('orderChannels', () => {
+describe('orderByUnwatched', () => {
   it('puts channels with the most unwatched videos first', () => {
     const channels = [
       aChannel({ id: 'a', unwatched_count: 0 }),
@@ -10,7 +16,7 @@ describe('orderChannels', () => {
       aChannel({ id: 'c', unwatched_count: 2 }),
     ]
 
-    expect(orderChannels(channels).map((channel) => channel.id)).toEqual(['b', 'c', 'a'])
+    expect(orderByUnwatched(channels).map((channel) => channel.id)).toEqual(['b', 'c', 'a'])
   })
 
   it('keeps the incoming order among ties and does not mutate the input', () => {
@@ -21,11 +27,33 @@ describe('orderChannels', () => {
       aChannel({ id: 'd', unwatched_count: 0 }),
     ]
 
-    const ordered = orderChannels(channels)
+    const ordered = orderByUnwatched(channels)
 
     expect(ordered.map((channel) => channel.id)).toEqual(['a', 'b', 'c', 'd'])
     expect(channels.map((channel) => channel.id)).toEqual(['a', 'b', 'c', 'd'])
     expect(ordered).not.toBe(channels)
+  })
+
+  it('orders entries by shown unwatched count', () => {
+    const playlists = [
+      aPlaylist({ id: 'a', unwatched_count: 0 }),
+      aPlaylist({ id: 'music', unwatched_count: 40, hide_unwatched_count: true }),
+      aPlaylist({ id: 'courses', unwatched_count: 2 }),
+      aPlaylist({ id: 'z', unwatched_count: 0 }),
+    ]
+
+    expect(orderByUnwatched(playlists).map((playlist) => playlist.id)).toEqual([
+      'courses',
+      'a',
+      'music',
+      'z',
+    ])
+  })
+})
+
+describe('shownUnwatchedCount', () => {
+  it('shows no unwatched count for an entry that hides it', () => {
+    expect(shownUnwatchedCount(aPlaylist({ unwatched_count: 3, hide_unwatched_count: true }))).toBe(0)
   })
 })
 

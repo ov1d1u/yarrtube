@@ -41,6 +41,7 @@ mod tests {
     use crate::domain::event::{DomainEvent, ScheduledEvent};
     use crate::domain::services::MetadataGenerator;
     use crate::domain::video::EpisodeNumber;
+    use crate::domain::video::PlaybackPosition;
     use crate::domain::video::PlaylistEpisodeNumber;
     use crate::domain::video::Video;
     use crate::domain::video::VideoDownloaded;
@@ -1202,6 +1203,178 @@ mod tests {
     }
 
     #[test]
+    fn it_should_keep_the_watch_state_recorded_while_downloading() {
+        let db = TestDatabase::new();
+        let video_repository = Arc::new(SqliteVideoRepository::new(db.database()));
+        let output_dir = tempfile::tempdir().unwrap();
+        let video = my_video();
+        video_repository.save(&video).unwrap();
+        SqliteChannelVideoRepository::new(db.database())
+            .save(&ChannelVideo::create(
+                my_channel_id(),
+                video.id.clone(),
+                0,
+                fixed_timestamp(),
+            ))
+            .unwrap();
+        let watching_repository = video_repository.clone();
+        let watched_id = video.id.clone();
+        let task = DownloadVideoTask::new(video_downloader(
+            &db,
+            video_repository.clone(),
+            Arc::new(
+                FakeVideoDownloaderRepository::succeeding_with(staged_download()).with_on_download(
+                    move || record_watch_state_meanwhile(&watching_repository, &watched_id),
+                ),
+            ),
+            Arc::new(FakeVideoFileRepository::default()),
+            Arc::new(FakeYoutubeMetadataRepository::default()),
+            Arc::new(SqliteVideoMetadataRepository::new(db.database())),
+        ));
+
+        let result = run(&task, &output_dir_payload(&video, output_dir.path()), false);
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            video_repository.list().unwrap(),
+            vec![with_watch_state_recorded_meanwhile(
+                video
+                    .start_download(fixed_timestamp())
+                    .mark_downloaded(
+                        Quality::High,
+                        "Season 2026/S2026E031501 - My Video.mp4",
+                        Some("Season 2026/S2026E031501 - My Video.jpg".to_string()),
+                        None,
+                        fixed_timestamp(),
+                    )
+                    .with_episode_number(published_episode(), fixed_timestamp())
+            )]
+        );
+    }
+
+    #[test]
+    fn it_should_keep_the_watch_state_recorded_while_a_failed_download_ran() {
+        let db = TestDatabase::new();
+        let video_repository = Arc::new(SqliteVideoRepository::new(db.database()));
+        let video = my_video();
+        video_repository.save(&video).unwrap();
+        let watching_repository = video_repository.clone();
+        let watched_id = video.id.clone();
+        let task = DownloadVideoTask::new(video_downloader(
+            &db,
+            video_repository.clone(),
+            Arc::new(
+                FakeVideoDownloaderRepository::new(false).with_on_download(move || {
+                    record_watch_state_meanwhile(&watching_repository, &watched_id)
+                }),
+            ),
+            Arc::new(FakeVideoFileRepository::default()),
+            Arc::new(FakeYoutubeMetadataRepository::default()),
+            Arc::new(SqliteVideoMetadataRepository::new(db.database())),
+        ));
+
+        let result = run(&task, &payload_for(video.id.as_str()), false);
+
+        assert_eq!(
+            result,
+            Err(format!("yt-dlp failed to download video {}", video.id))
+        );
+        assert_eq!(
+            video_repository.list().unwrap(),
+            vec![with_watch_state_recorded_meanwhile(
+                video
+                    .start_download(fixed_timestamp())
+                    .mark_errored_retrying(fixed_timestamp())
+            )]
+        );
+    }
+
+    #[test]
+    fn it_should_keep_the_watch_state_recorded_while_downloading_an_excluded_video() {
+        let db = TestDatabase::new();
+        let video_repository = Arc::new(SqliteVideoRepository::new(db.database()));
+        let video = my_video();
+        video_repository.save(&video).unwrap();
+        let watching_repository = video_repository.clone();
+        let watched_id = video.id.clone();
+        let task = DownloadVideoTask::new(video_downloader(
+            &db,
+            video_repository.clone(),
+            Arc::new(
+                FakeVideoDownloaderRepository::new(false)
+                    .with_diagnosed_reason("This video has been removed by the uploader.")
+                    .with_on_download(move || {
+                        record_watch_state_meanwhile(&watching_repository, &watched_id)
+                    }),
+            ),
+            Arc::new(FakeVideoFileRepository::default()),
+            Arc::new(FakeYoutubeMetadataRepository::default()),
+            Arc::new(SqliteVideoMetadataRepository::new(db.database())),
+        ));
+
+        let result = run(&task, &payload_for(video.id.as_str()), false);
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            video_repository.list().unwrap(),
+            vec![with_watch_state_recorded_meanwhile(
+                video
+                    .start_download(fixed_timestamp())
+                    .mark_excluded(fixed_timestamp())
+            )]
+        );
+    }
+
+    #[test]
+    fn it_should_keep_the_watch_state_recorded_while_downloading_if_placing_fails() {
+        let db = TestDatabase::new();
+        let video_repository = Arc::new(SqliteVideoRepository::new(db.database()));
+        let output_dir = tempfile::tempdir().unwrap();
+        let video = my_video();
+        let staged_media =
+            PathBuf::from(format!("/videos/.downloads/{}/yt1.mp4", video.id.as_str()));
+        video_repository.save(&video).unwrap();
+        SqliteChannelVideoRepository::new(db.database())
+            .save(&ChannelVideo::create(
+                my_channel_id(),
+                video.id.clone(),
+                0,
+                fixed_timestamp(),
+            ))
+            .unwrap();
+        let watching_repository = video_repository.clone();
+        let watched_id = video.id.clone();
+        let task = DownloadVideoTask::new(video_downloader(
+            &db,
+            video_repository.clone(),
+            Arc::new(
+                FakeVideoDownloaderRepository::succeeding_with(staged_download()).with_on_download(
+                    move || record_watch_state_meanwhile(&watching_repository, &watched_id),
+                ),
+            ),
+            Arc::new(FakeVideoFileRepository::default().with_failing_move(staged_media.clone())),
+            Arc::new(FakeYoutubeMetadataRepository::default()),
+            Arc::new(SqliteVideoMetadataRepository::new(db.database())),
+        ));
+
+        let result = run(&task, &output_dir_payload(&video, output_dir.path()), true);
+
+        assert_eq!(
+            result,
+            Err(format!("permission denied moving {staged_media:?}"))
+        );
+        assert_eq!(
+            video_repository.list().unwrap(),
+            vec![with_watch_state_recorded_meanwhile(
+                video
+                    .start_download(fixed_timestamp())
+                    .mark_errored(fixed_timestamp())
+                    .with_episode_number(published_episode(), fixed_timestamp())
+            )]
+        );
+    }
+
+    #[test]
     fn it_should_use_the_sanitized_title_as_filename() {
         let db = TestDatabase::new();
         let video_repository = Arc::new(SqliteVideoRepository::new(db.database()));
@@ -1789,6 +1962,28 @@ mod tests {
         }
         .payload()
         .to_string()
+    }
+
+    /// Stores the video as played and watched, the way marking another copy
+    /// watched or playing it does while its download runs.
+    fn record_watch_state_meanwhile(video_repository: &SqliteVideoRepository, id: &VideoRecordId) {
+        let current = video_repository.find(id).unwrap().unwrap();
+        video_repository
+            .update(&with_watch_state_recorded_meanwhile(current))
+            .unwrap();
+    }
+
+    fn with_watch_state_recorded_meanwhile(video: Video) -> Video {
+        Video {
+            watched_at: Some(watched_timestamp()),
+            playback_position: PlaybackPosition::new(42).unwrap(),
+            last_played_at: Some(watched_timestamp()),
+            ..video
+        }
+    }
+
+    fn watched_timestamp() -> DateTime<Utc> {
+        DateTime::<Utc>::from_timestamp(1_700_000_100, 0).unwrap()
     }
 
     fn fixed_timestamp() -> DateTime<Utc> {

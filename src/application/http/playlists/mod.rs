@@ -3,28 +3,30 @@ pub mod dto;
 use super::blocking::run_blocking;
 use super::error::ApiError;
 use super::validation::{MISSING_QUALITY, required};
+use super::videos::update_watch_state_error;
 use crate::domain::playlist::PlaylistId;
 use crate::domain::playlist::{
-    CreatePlaylistError, DeletePlaylistError, PlaylistPath, PreviewPlaylistError,
-    UpdatePlaylistError,
+    CreatePlaylistError, DeletePlaylistError, PlaylistPath, PlaylistSettingsChange,
+    PreviewPlaylistError, UpdatePlaylistError,
 };
 use crate::domain::services::{
     CreatePlaylistOutcome, PlaylistCreator, PlaylistCreatorApi, PlaylistDeleter,
-    PlaylistDeleterApi, PlaylistPreviewer, PlaylistPreviewerApi, PlaylistSearcher,
-    PlaylistSearcherApi, PlaylistUpdater, PlaylistUpdaterApi, PlaylistVideoReconciler,
-    PlaylistVideoReconcilerApi,
+    PlaylistDeleterApi, PlaylistPreviewer, PlaylistPreviewerApi, PlaylistUpdater,
+    PlaylistUpdaterApi, PlaylistVideoReconciler, PlaylistVideoReconcilerApi, PlaylistViewSearcher,
+    PlaylistViewSearcherApi, VideoWatchStateUpdater, VideoWatchStateUpdaterApi,
 };
 use crate::domain::shared::{Quality, ReconcileInterval};
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use dto::{
-    CreatePlaylistRequest, PlaylistPreviewResponse, PlaylistResponse, PreviewPlaylistQuery,
-    UpdatePlaylistRequest,
+    CreatePlaylistRequest, PlaylistListItemResponse, PlaylistPreviewResponse, PlaylistResponse,
+    PreviewPlaylistQuery, UpdatePlaylistRequest,
 };
 
 const MISSING_PATH: &str = "Playlist path must not be empty";
-const NOTHING_TO_UPDATE: &str = "Request must change exclude from home or the reconcile interval";
+const NOTHING_TO_UPDATE: &str =
+    "Request must change exclude from home, hide unwatched count or the reconcile interval";
 
 pub async fn create_playlist(
     State(playlist_creator): State<PlaylistCreator>,
@@ -93,19 +95,19 @@ pub async fn update_playlist(
     Json(request): Json<UpdatePlaylistRequest>,
 ) -> Result<Json<PlaylistResponse>, ApiError> {
     let id = PlaylistId::new(id)?;
-    let reconcile_interval = request
-        .reconcile_interval_minutes
-        .map(ReconcileInterval::new)
-        .transpose()?;
-    if request.exclude_from_home.is_none() && reconcile_interval.is_none() {
+    let change = PlaylistSettingsChange {
+        exclude_from_home: request.exclude_from_home,
+        hide_unwatched_count: request.hide_unwatched_count,
+        reconcile_interval: request
+            .reconcile_interval_minutes
+            .map(ReconcileInterval::new)
+            .transpose()?,
+    };
+    if change.is_empty() {
         return Err(ApiError::bad_request(NOTHING_TO_UPDATE));
     }
 
-    match run_blocking(move || {
-        playlist_updater.update_settings(id, request.exclude_from_home, reconcile_interval)
-    })
-    .await?
-    {
+    match run_blocking(move || playlist_updater.update_settings(id, change)).await? {
         Ok(playlist) => Ok(Json(PlaylistResponse::from(playlist))),
         Err(e @ UpdatePlaylistError::NotFound(_)) => Err(ApiError::new(StatusCode::NOT_FOUND, e)),
         Err(e @ UpdatePlaylistError::Repository(_)) => Err(ApiError::internal(e)),
@@ -126,24 +128,43 @@ pub async fn reconcile_playlist(
 }
 
 pub async fn list_playlists(
-    State(playlist_searcher): State<PlaylistSearcher>,
-) -> Result<Json<Vec<PlaylistResponse>>, ApiError> {
-    let playlists = run_blocking(move || playlist_searcher.search_all())
+    State(playlist_view_searcher): State<PlaylistViewSearcher>,
+) -> Result<Json<Vec<PlaylistListItemResponse>>, ApiError> {
+    let playlists = run_blocking(move || playlist_view_searcher.search_all())
         .await?
         .map_err(ApiError::internal)?;
     Ok(Json(
-        playlists.into_iter().map(PlaylistResponse::from).collect(),
+        playlists
+            .into_iter()
+            .map(PlaylistListItemResponse::from)
+            .collect(),
     ))
+}
+
+pub async fn mark_playlist_watched(
+    State(video_watch_state_updater): State<VideoWatchStateUpdater>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let playlist_id = PlaylistId::new(id)?;
+
+    run_blocking(move || video_watch_state_updater.mark_playlist_watched(&playlist_id))
+        .await?
+        .map_err(update_watch_state_error)?;
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::channel::ChannelHandle;
+    use crate::domain::channel_video::ChannelVideo;
     use crate::domain::event::{DomainEvent, ScheduledEvent};
     use crate::domain::playlist::{Playlist, PlaylistKind, PlaylistName};
     use crate::domain::playlist::{PlaylistCreated, PlaylistDeleted};
     use crate::domain::playlist_video::PlaylistVideo;
     use crate::domain::playlist_video::{VideoAddedToPlaylist, VideoRemovedFromPlaylist};
+    use crate::domain::services::CategoryVideoCollector;
     use crate::domain::services::InternalVideoReconciler;
     use crate::domain::services::MetadataGenerator;
     use crate::domain::services::ShowFileWriter;
@@ -160,6 +181,11 @@ mod tests {
     use crate::infrastructure::repositories::filesystem_channel_avatar_repository::FakeChannelAvatarRepository;
     use crate::infrastructure::repositories::filesystem_show_file_repository::FakeShowFileRepository;
     use crate::infrastructure::repositories::filesystem_video_file_repository::FakeVideoFileRepository;
+    use crate::infrastructure::repositories::sqlite_category_repository::SqliteCategoryRepository;
+    use crate::infrastructure::repositories::sqlite_channel_repository::SqliteChannelRepository;
+    use crate::infrastructure::repositories::sqlite_channel_video_repository::{
+        ChannelVideoRepository, SqliteChannelVideoRepository,
+    };
     use crate::infrastructure::repositories::sqlite_playlist_repository::{
         PlaylistRepository, SqlitePlaylistRepository,
     };
@@ -223,6 +249,40 @@ mod tests {
         assert_eq!(
             event_repository.list_eligible().unwrap(),
             vec![pending_event(1, playlist_created("PL1"))]
+        );
+    }
+
+    #[tokio::test]
+    async fn it_should_create_a_playlist_showing_its_unwatched_count() {
+        let db = TestDatabase::new();
+        let playlist_repository = Arc::new(SqlitePlaylistRepository::new(db.database()));
+        let playlist_creator = PlaylistCreator::new(
+            playlist_repository.clone(),
+            Arc::new(FakeYoutubePlaylistRepository {
+                resolved: Some(resolved_playlist()),
+            }),
+            event_publisher(&db),
+            Arc::new(FixedClock(fixed_timestamp())),
+        );
+
+        let response = create(playlist_creator, create_request("PL1")).await;
+
+        assert_eq!(
+            response,
+            Ok((
+                StatusCode::CREATED,
+                PlaylistResponse {
+                    hide_unwatched_count: false,
+                    ..playlist_response("PL1", DEFAULT_PATH)
+                }
+            ))
+        );
+        assert_eq!(
+            playlist_repository.list().unwrap(),
+            vec![Playlist {
+                hide_unwatched_count: false,
+                ..playlist("PL1", DEFAULT_PATH)
+            }]
         );
     }
 
@@ -1194,10 +1254,13 @@ mod tests {
     #[tokio::test]
     async fn it_should_list_no_playlists() {
         let db = TestDatabase::new();
-        let playlist_searcher =
-            PlaylistSearcher::new(Arc::new(SqlitePlaylistRepository::new(db.database())));
+        let playlist_view_searcher = PlaylistViewSearcher::new(
+            Arc::new(SqlitePlaylistRepository::new(db.database())),
+            Arc::new(SqlitePlaylistVideoRepository::new(db.database())),
+            Arc::new(SqliteVideoRepository::new(db.database())),
+        );
 
-        let response = list(playlist_searcher).await;
+        let response = list(playlist_view_searcher).await;
 
         assert_eq!(response, Ok(vec![]));
     }
@@ -1212,15 +1275,19 @@ mod tests {
         playlist_repository
             .insert(&playlist("PL2", "music/second"))
             .unwrap();
-        let playlist_searcher = PlaylistSearcher::new(playlist_repository);
+        let playlist_view_searcher = PlaylistViewSearcher::new(
+            playlist_repository,
+            Arc::new(SqlitePlaylistVideoRepository::new(db.database())),
+            Arc::new(SqliteVideoRepository::new(db.database())),
+        );
 
-        let response = list(playlist_searcher).await;
+        let response = list(playlist_view_searcher).await;
 
         assert_eq!(
             response,
             Ok(vec![
-                playlist_response("PL1", "music/first"),
-                playlist_response("PL2", "music/second"),
+                playlist_list_item_response("PL1", "music/first"),
+                playlist_list_item_response("PL2", "music/second"),
             ])
         );
     }
@@ -1238,17 +1305,21 @@ mod tests {
                 ..playlist("PL2", "music/second")
             })
             .unwrap();
-        let playlist_searcher = PlaylistSearcher::new(playlist_repository);
+        let playlist_view_searcher = PlaylistViewSearcher::new(
+            playlist_repository,
+            Arc::new(SqlitePlaylistVideoRepository::new(db.database())),
+            Arc::new(SqliteVideoRepository::new(db.database())),
+        );
 
-        let response = list(playlist_searcher).await;
+        let response = list(playlist_view_searcher).await;
 
         assert_eq!(
             response,
             Ok(vec![
-                playlist_response("PL1", "music/first"),
-                PlaylistResponse {
+                playlist_list_item_response("PL1", "music/first"),
+                PlaylistListItemResponse {
                     exclude_from_home: true,
-                    ..playlist_response("PL2", "music/second")
+                    ..playlist_list_item_response("PL2", "music/second")
                 },
             ])
         );
@@ -1264,15 +1335,19 @@ mod tests {
                     .with_reconcile_interval(ReconcileInterval::new(720).unwrap()),
             )
             .unwrap();
-        let playlist_searcher = PlaylistSearcher::new(playlist_repository);
+        let playlist_view_searcher = PlaylistViewSearcher::new(
+            playlist_repository,
+            Arc::new(SqlitePlaylistVideoRepository::new(db.database())),
+            Arc::new(SqliteVideoRepository::new(db.database())),
+        );
 
-        let response = list(playlist_searcher).await;
+        let response = list(playlist_view_searcher).await;
 
         assert_eq!(
             response,
-            Ok(vec![PlaylistResponse {
+            Ok(vec![PlaylistListItemResponse {
                 reconcile_interval_minutes: 720,
-                ..playlist_response("PL1", DEFAULT_PATH)
+                ..playlist_list_item_response("PL1", DEFAULT_PATH)
             }])
         );
     }
@@ -1293,26 +1368,122 @@ mod tests {
                 })
                 .unwrap();
         }
-        let playlist_searcher = PlaylistSearcher::new(playlist_repository);
+        let playlist_view_searcher = PlaylistViewSearcher::new(
+            playlist_repository,
+            Arc::new(SqlitePlaylistVideoRepository::new(db.database())),
+            Arc::new(SqliteVideoRepository::new(db.database())),
+        );
 
-        let response = list(playlist_searcher).await;
+        let response = list(playlist_view_searcher).await;
 
         assert_eq!(
             response,
             Ok(vec![
-                PlaylistResponse {
+                PlaylistListItemResponse {
                     name: "Ambient".to_string(),
-                    ..playlist_response("PL3", "music/list")
+                    ..playlist_list_item_response("PL3", "music/list")
                 },
-                PlaylistResponse {
+                PlaylistListItemResponse {
                     name: "Courses".to_string(),
-                    ..playlist_response("PL2", "music/list")
+                    ..playlist_list_item_response("PL2", "music/list")
                 },
-                PlaylistResponse {
+                PlaylistListItemResponse {
                     name: "watch later".to_string(),
-                    ..playlist_response("PL1", "music/list")
+                    ..playlist_list_item_response("PL1", "music/list")
                 },
             ])
+        );
+    }
+
+    #[tokio::test]
+    async fn it_should_count_unwatched_downloaded_videos_when_listing_playlists() {
+        let db = TestDatabase::new();
+        let playlist_repository = Arc::new(SqlitePlaylistRepository::new(db.database()));
+        let playlist_video_repository = Arc::new(SqlitePlaylistVideoRepository::new(db.database()));
+        let video_repository = Arc::new(SqliteVideoRepository::new(db.database()));
+        playlist_repository
+            .insert(&playlist("PL1", "music/first"))
+            .unwrap();
+        playlist_repository
+            .insert(&playlist("PL2", "music/second"))
+            .unwrap();
+        for (youtube_id, position) in [("vid_unwatched_1", 0), ("vid_unwatched_2", 1)] {
+            save_downloaded_playlist_video(
+                video_repository.as_ref(),
+                playlist_video_repository.as_ref(),
+                "PL1",
+                youtube_id,
+                position,
+            );
+        }
+        let watched = save_downloaded_playlist_video(
+            video_repository.as_ref(),
+            playlist_video_repository.as_ref(),
+            "PL1",
+            "vid_watched",
+            2,
+        );
+        video_repository
+            .update(&watched.mark_watched(fixed_timestamp()))
+            .unwrap();
+        save_playlist_video(
+            video_repository.as_ref(),
+            playlist_video_repository.as_ref(),
+            "PL1",
+            "vid_pending",
+            3,
+        );
+        let playlist_view_searcher = PlaylistViewSearcher::new(
+            playlist_repository,
+            playlist_video_repository,
+            video_repository,
+        );
+
+        let response = list(playlist_view_searcher).await;
+
+        assert_eq!(
+            response,
+            Ok(vec![
+                PlaylistListItemResponse {
+                    unwatched_count: 2,
+                    ..playlist_list_item_response("PL1", "music/first")
+                },
+                playlist_list_item_response("PL2", "music/second"),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn it_should_list_playlists_with_their_hide_unwatched_count() {
+        let db = TestDatabase::new();
+        let playlist_repository = Arc::new(SqlitePlaylistRepository::new(db.database()));
+        let playlist_video_repository = Arc::new(SqlitePlaylistVideoRepository::new(db.database()));
+        let video_repository = Arc::new(SqliteVideoRepository::new(db.database()));
+        playlist_repository
+            .insert(&playlist("PL1", DEFAULT_PATH).with_hide_unwatched_count(true))
+            .unwrap();
+        save_downloaded_playlist_video(
+            video_repository.as_ref(),
+            playlist_video_repository.as_ref(),
+            "PL1",
+            "vid_unwatched",
+            0,
+        );
+        let playlist_view_searcher = PlaylistViewSearcher::new(
+            playlist_repository,
+            playlist_video_repository,
+            video_repository,
+        );
+
+        let response = list(playlist_view_searcher).await;
+
+        assert_eq!(
+            response,
+            Ok(vec![PlaylistListItemResponse {
+                hide_unwatched_count: true,
+                unwatched_count: 1,
+                ..playlist_list_item_response("PL1", DEFAULT_PATH)
+            }])
         );
     }
 
@@ -1347,6 +1518,67 @@ mod tests {
                 exclude_from_home: true,
                 ..playlist("PL1", DEFAULT_PATH)
             }]
+        );
+    }
+
+    #[tokio::test]
+    async fn it_should_hide_a_playlists_unwatched_count() {
+        let db = TestDatabase::new();
+        let playlist_repository = Arc::new(SqlitePlaylistRepository::new(db.database()));
+        let stored = Playlist {
+            exclude_from_home: true,
+            ..playlist("PL1", DEFAULT_PATH)
+        }
+        .with_reconcile_interval(ReconcileInterval::new(720).unwrap());
+        playlist_repository.insert(&stored).unwrap();
+        let playlist_updater = PlaylistUpdater::new(
+            playlist_repository.clone(),
+            Arc::new(SqliteTaskRepository::new(
+                db.database(),
+                Arc::new(FixedClock(fixed_timestamp())),
+            )),
+            Arc::new(FixedClock(fixed_timestamp())),
+        );
+
+        let response = update(playlist_updater, "PL1", hide_count_request(true)).await;
+
+        assert_eq!(
+            response,
+            Ok(PlaylistResponse {
+                exclude_from_home: true,
+                hide_unwatched_count: true,
+                reconcile_interval_minutes: 720,
+                ..playlist_response("PL1", DEFAULT_PATH)
+            })
+        );
+        assert_eq!(
+            playlist_repository.list().unwrap(),
+            vec![stored.with_hide_unwatched_count(true)]
+        );
+    }
+
+    #[tokio::test]
+    async fn it_should_show_a_playlists_unwatched_count_again() {
+        let db = TestDatabase::new();
+        let playlist_repository = Arc::new(SqlitePlaylistRepository::new(db.database()));
+        playlist_repository
+            .insert(&playlist("PL1", DEFAULT_PATH).with_hide_unwatched_count(true))
+            .unwrap();
+        let playlist_updater = PlaylistUpdater::new(
+            playlist_repository.clone(),
+            Arc::new(SqliteTaskRepository::new(
+                db.database(),
+                Arc::new(FixedClock(fixed_timestamp())),
+            )),
+            Arc::new(FixedClock(fixed_timestamp())),
+        );
+
+        let response = update(playlist_updater, "PL1", hide_count_request(false)).await;
+
+        assert_eq!(response, Ok(playlist_response("PL1", DEFAULT_PATH)));
+        assert_eq!(
+            playlist_repository.list().unwrap(),
+            vec![playlist("PL1", DEFAULT_PATH)]
         );
     }
 
@@ -1621,7 +1853,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn it_should_fail_to_update_if_nothing_to_update() {
+    async fn it_should_fail_to_update_if_nothing_to_change() {
         let request = empty_update_request();
 
         let response = update(any_playlist_updater(), "PL1", request).await;
@@ -1629,7 +1861,7 @@ mod tests {
         assert_eq!(
             response,
             Err(ApiError::bad_request(
-                "Request must change exclude from home or the reconcile interval"
+                "Request must change exclude from home, hide unwatched count or the reconcile interval"
             ))
         );
     }
@@ -2024,6 +2256,116 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn it_should_mark_every_downloaded_playlist_video_watched() {
+        let db = TestDatabase::new();
+        let video_repository = Arc::new(SqliteVideoRepository::new(db.database()));
+        let playlist_video_repository = Arc::new(SqlitePlaylistVideoRepository::new(db.database()));
+        let channel_video_repository = Arc::new(SqliteChannelVideoRepository::new(db.database()));
+        let playlist_repository = Arc::new(SqlitePlaylistRepository::new(db.database()));
+        playlist_repository
+            .insert(&playlist("PL1", DEFAULT_PATH))
+            .unwrap();
+        let downloaded = save_downloaded_playlist_video(
+            video_repository.as_ref(),
+            playlist_video_repository.as_ref(),
+            "PL1",
+            "vid_downloaded",
+            0,
+        );
+        let (pending, _) = save_playlist_video(
+            video_repository.as_ref(),
+            playlist_video_repository.as_ref(),
+            "PL1",
+            "vid_pending",
+            1,
+        );
+        let shared = save_downloaded_playlist_video(
+            video_repository.as_ref(),
+            playlist_video_repository.as_ref(),
+            "PL1",
+            "vid_shared",
+            2,
+        );
+        let channel_copy = downloaded_video("vid_shared");
+        video_repository.save(&channel_copy).unwrap();
+        channel_video_repository
+            .save(&ChannelVideo::create(
+                ChannelHandle::new("@somechannel").unwrap(),
+                channel_copy.id.clone(),
+                0,
+                fixed_timestamp(),
+            ))
+            .unwrap();
+        let video_watch_state_updater = VideoWatchStateUpdater::new(
+            video_repository.clone(),
+            Arc::new(SqliteChannelRepository::new(db.database())),
+            channel_video_repository,
+            playlist_repository,
+            playlist_video_repository,
+            Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
+        );
+
+        let response = mark_watched(video_watch_state_updater, "PL1").await;
+
+        assert_eq!(response, Ok(StatusCode::NO_CONTENT));
+        assert_eq!(
+            video_repository.list().unwrap(),
+            vec![
+                downloaded.mark_watched(watched_timestamp()),
+                pending,
+                shared.mark_watched(watched_timestamp()),
+                channel_copy.mark_watched(watched_timestamp()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn it_should_fail_to_mark_watched_a_missing_playlist() {
+        let db = TestDatabase::new();
+        let video_repository = Arc::new(SqliteVideoRepository::new(db.database()));
+        let playlist_video_repository = Arc::new(SqlitePlaylistVideoRepository::new(db.database()));
+        let video = save_downloaded_playlist_video(
+            video_repository.as_ref(),
+            playlist_video_repository.as_ref(),
+            "PLmissing",
+            "vid1",
+            0,
+        );
+        let video_watch_state_updater = VideoWatchStateUpdater::new(
+            video_repository.clone(),
+            Arc::new(SqliteChannelRepository::new(db.database())),
+            Arc::new(SqliteChannelVideoRepository::new(db.database())),
+            Arc::new(SqlitePlaylistRepository::new(db.database())),
+            playlist_video_repository,
+            Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(db.database())),
+            category_video_collector(&db),
+        );
+
+        let response = mark_watched(video_watch_state_updater, "PLmissing").await;
+
+        assert_eq!(
+            response,
+            Err(ApiError::bad_request("playlist PLmissing not found"))
+        );
+        assert_eq!(video_repository.list().unwrap(), vec![video]);
+    }
+
+    #[tokio::test]
+    async fn it_should_fail_to_mark_watched_if_invalid_playlist_id_provided() {
+        let response = mark_watched(any_video_watch_state_updater(), " ").await;
+
+        assert_eq!(
+            response,
+            Err(ApiError::bad_request(
+                "YouTube playlist ID must not be empty"
+            ))
+        );
+    }
+
     /// A creator for tests whose request is rejected before reaching it. Its
     /// repositories sit on an unmigrated in-memory database, so a request that
     /// wrongly got through would fail loudly instead of passing.
@@ -2217,6 +2559,21 @@ mod tests {
         }
     }
 
+    /// An updater for tests whose request is rejected before reaching it, on
+    /// an unmigrated in-memory database.
+    fn any_video_watch_state_updater() -> VideoWatchStateUpdater {
+        VideoWatchStateUpdater::new(
+            Arc::new(SqliteVideoRepository::new(unused_connection())),
+            Arc::new(SqliteChannelRepository::new(unused_connection())),
+            Arc::new(SqliteChannelVideoRepository::new(unused_connection())),
+            Arc::new(SqlitePlaylistRepository::new(unused_connection())),
+            Arc::new(SqlitePlaylistVideoRepository::new(unused_connection())),
+            Arc::new(FixedClock(watched_timestamp())),
+            Arc::new(SqliteCategoryRepository::new(unused_connection())),
+            any_category_video_collector(),
+        )
+    }
+
     fn unused_connection() -> crate::infrastructure::shared::sqlite_connection::Database {
         crate::infrastructure::shared::sqlite_connection::Database::single(
             Connection::open_in_memory().unwrap(),
@@ -2282,6 +2639,10 @@ mod tests {
 
     fn fixed_timestamp() -> DateTime<Utc> {
         DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap()
+    }
+
+    fn watched_timestamp() -> DateTime<Utc> {
+        DateTime::<Utc>::from_timestamp(1_800_000_000, 0).unwrap()
     }
 
     fn playlist_id(id: &str) -> PlaylistId {
@@ -2353,6 +2714,43 @@ mod tests {
         (video, playlist_video)
     }
 
+    /// Saves a downloaded video and its playlist membership, returning the
+    /// video as stored.
+    fn save_downloaded_playlist_video(
+        video_repository: &dyn VideoRepository,
+        playlist_video_repository: &dyn PlaylistVideoRepository,
+        playlist: &str,
+        youtube_id: &str,
+        position: i64,
+    ) -> Video {
+        let video = downloaded_video(youtube_id);
+        video_repository.save(&video).unwrap();
+        playlist_video_repository
+            .save(&PlaylistVideo::create(
+                playlist_id(playlist),
+                video.id.clone(),
+                position,
+                fixed_timestamp(),
+            ))
+            .unwrap();
+        video
+    }
+
+    fn downloaded_video(youtube_id: &str) -> Video {
+        Video::create(
+            VideoId::new(youtube_id).unwrap(),
+            format!("Video {youtube_id}"),
+            fixed_timestamp(),
+        )
+        .mark_downloaded(
+            Quality::High,
+            format!("Video {youtube_id}.mp4"),
+            None,
+            Some(100),
+            fixed_timestamp(),
+        )
+    }
+
     fn playlist_item(video_id: &str, title: &str, position: i64) -> YoutubePlaylistItem {
         YoutubePlaylistItem {
             video_id: video_id.to_string(),
@@ -2387,6 +2785,7 @@ mod tests {
     fn empty_update_request() -> UpdatePlaylistRequest {
         UpdatePlaylistRequest {
             exclude_from_home: None,
+            hide_unwatched_count: None,
             reconcile_interval_minutes: None,
         }
     }
@@ -2394,7 +2793,15 @@ mod tests {
     fn update_request(exclude_from_home: bool) -> UpdatePlaylistRequest {
         UpdatePlaylistRequest {
             exclude_from_home: Some(exclude_from_home),
+            hide_unwatched_count: None,
             reconcile_interval_minutes: None,
+        }
+    }
+
+    fn hide_count_request(hide_unwatched_count: bool) -> UpdatePlaylistRequest {
+        UpdatePlaylistRequest {
+            hide_unwatched_count: Some(hide_unwatched_count),
+            ..empty_update_request()
         }
     }
 
@@ -2420,8 +2827,24 @@ mod tests {
             quality: "high".to_string(),
             kind: "youtube_linked".to_string(),
             exclude_from_home: false,
+            hide_unwatched_count: false,
             reconcile_interval_minutes: 180,
             created_at: fixed_timestamp(),
+        }
+    }
+
+    fn playlist_list_item_response(id: &str, path: &str) -> PlaylistListItemResponse {
+        PlaylistListItemResponse {
+            id: id.to_string(),
+            name: "Lofi beats".to_string(),
+            path: path.to_string(),
+            quality: "high".to_string(),
+            kind: "youtube_linked".to_string(),
+            exclude_from_home: false,
+            hide_unwatched_count: false,
+            reconcile_interval_minutes: 180,
+            created_at: fixed_timestamp(),
+            unwatched_count: 0,
         }
     }
 
@@ -2447,8 +2870,10 @@ mod tests {
         delete_playlist(State(playlist_deleter), Path(id.to_string())).await
     }
 
-    async fn list(playlist_searcher: PlaylistSearcher) -> Result<Vec<PlaylistResponse>, ApiError> {
-        list_playlists(State(playlist_searcher))
+    async fn list(
+        playlist_view_searcher: PlaylistViewSearcher,
+    ) -> Result<Vec<PlaylistListItemResponse>, ApiError> {
+        list_playlists(State(playlist_view_searcher))
             .await
             .map(|Json(playlists)| playlists)
     }
@@ -2463,10 +2888,40 @@ mod tests {
             .map(|Json(playlist)| playlist)
     }
 
+    async fn mark_watched(
+        video_watch_state_updater: VideoWatchStateUpdater,
+        id: &str,
+    ) -> Result<StatusCode, ApiError> {
+        mark_playlist_watched(State(video_watch_state_updater), Path(id.to_string())).await
+    }
+
     async fn reconcile(
         playlist_video_reconciler: PlaylistVideoReconciler,
         id: &str,
     ) -> Result<StatusCode, ApiError> {
         reconcile_playlist(State(playlist_video_reconciler), Path(id.to_string())).await
+    }
+
+    /// The collector the updater reads category videos through, on `db` like
+    /// the repositories each test seeds.
+    fn category_video_collector(db: &TestDatabase) -> CategoryVideoCollector {
+        CategoryVideoCollector::new(
+            Arc::new(SqliteChannelRepository::new(db.database())),
+            Arc::new(SqliteChannelVideoRepository::new(db.database())),
+            Arc::new(SqlitePlaylistRepository::new(db.database())),
+            Arc::new(SqlitePlaylistVideoRepository::new(db.database())),
+            Arc::new(SqliteVideoRepository::new(db.database())),
+        )
+    }
+
+    /// A collector on an unmigrated in-memory database.
+    fn any_category_video_collector() -> CategoryVideoCollector {
+        CategoryVideoCollector::new(
+            Arc::new(SqliteChannelRepository::new(unused_connection())),
+            Arc::new(SqliteChannelVideoRepository::new(unused_connection())),
+            Arc::new(SqlitePlaylistRepository::new(unused_connection())),
+            Arc::new(SqlitePlaylistVideoRepository::new(unused_connection())),
+            Arc::new(SqliteVideoRepository::new(unused_connection())),
+        )
     }
 }

@@ -7,9 +7,10 @@ import {
   usePlaylistVideos,
   useRemoveQuery,
   useSetPlaylistExcludedFromHome,
+  useSetPlaylistUnwatchedCountHidden,
   useUpdatePlaylistSettings,
 } from '@/api/queries'
-import { reconcilePlaylist, deletePlaylist } from '@/api/client'
+import { reconcilePlaylist, deletePlaylist, markPlaylistWatched } from '@/api/client'
 import { useWatchProgress } from '@/hooks/useWatchProgress'
 import { usePlaybackSpeed } from '@/hooks/usePlaybackSpeed'
 import { useVideoSelection } from '@/hooks/useVideoSelection'
@@ -26,6 +27,7 @@ export function PlaylistDetail() {
   const refreshing = useLibraryAction()
   const removeQuery = useRemoveQuery()
   const setPlaylistExcludedFromHome = useSetPlaylistExcludedFromHome()
+  const setPlaylistUnwatchedCountHidden = useSetPlaylistUnwatchedCountHidden()
   const updatePlaylistSettings = useUpdatePlaylistSettings()
   const [editing, setEditing] = useState(false)
   const playlist = playlists?.find((item) => item.id === id) ?? null
@@ -56,9 +58,13 @@ export function PlaylistDetail() {
       <DetailHeader
         name={playlist.name}
         videos={videos}
+        unwatchedCount={playlist.unwatched_count}
         onSync={refreshing(() => reconcilePlaylist(id))}
+        onMarkWatched={refreshing(() => markPlaylistWatched(id))}
         excludedFromHome={playlist.exclude_from_home}
         onSetExcludedFromHome={(excluded) => setPlaylistExcludedFromHome(id, excluded)}
+        unwatchedCountHidden={playlist.hide_unwatched_count}
+        onSetUnwatchedCountHidden={(hidden) => setPlaylistUnwatchedCountHidden(id, hidden)}
         onEditRequest={() => setEditing(true)}
         onDelete={refreshing(async () => {
           await deletePlaylist(id)
