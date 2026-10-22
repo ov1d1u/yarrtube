@@ -1,7 +1,7 @@
 pub mod dto;
 
 use super::blocking::run_blocking;
-use super::error::ApiError;
+use super::error::{ApiError, move_show_error};
 use super::validation::{MISSING_QUALITY, required};
 use super::videos::update_watch_state_error;
 use crate::domain::channel::{
@@ -13,7 +13,7 @@ use crate::domain::services::{
     ChannelCreator, ChannelCreatorApi, ChannelDeleter, ChannelDeleterApi, ChannelPreviewer,
     ChannelPreviewerApi, ChannelUpdater, ChannelUpdaterApi, ChannelVideoReconciler,
     ChannelVideoReconcilerApi, ChannelViewSearcher, ChannelViewSearcherApi, CreateChannelOutcome,
-    VideoWatchStateUpdater, VideoWatchStateUpdaterApi,
+    ShowMover, ShowMoverApi, VideoWatchStateUpdater, VideoWatchStateUpdaterApi,
 };
 use crate::domain::shared::{Quality, ReconcileInterval};
 use axum::Json;
@@ -21,7 +21,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use dto::{
     ChannelListItemResponse, ChannelPreviewResponse, ChannelResponse, CreateChannelRequest,
-    PreviewChannelQuery, UpdateChannelRequest,
+    MoveChannelRequest, PreviewChannelQuery, UpdateChannelRequest,
 };
 
 const MISSING_VIDEO_LIMIT: &str = "Video limit must be a positive integer (missing)";
@@ -116,6 +116,20 @@ pub async fn update_channel(
     }
 }
 
+pub async fn move_channel(
+    State(show_mover): State<ShowMover>,
+    Path(handle): Path<String>,
+    Json(request): Json<MoveChannelRequest>,
+) -> Result<Json<ChannelResponse>, ApiError> {
+    let id = ChannelHandle::new(handle)?;
+    let path = PlaylistPath::new(required(request.path, MISSING_PATH)?)?;
+
+    run_blocking(move || show_mover.move_channel(id, path))
+        .await?
+        .map(|channel| Json(ChannelResponse::from(channel)))
+        .map_err(move_show_error)
+}
+
 pub async fn list_channels(
     State(channel_view_searcher): State<ChannelViewSearcher>,
 ) -> Result<Json<Vec<ChannelListItemResponse>>, ApiError> {
@@ -174,6 +188,7 @@ mod tests {
     use crate::domain::services::SubtitleFetcher;
     use crate::domain::services::ThumbnailFetcher;
     use crate::domain::services::VideoRelocator;
+    use crate::domain::show::ShowMoved;
     use crate::domain::task::{ScheduledTask, Task, TaskStatus};
     use crate::domain::video::VideoId;
     use crate::domain::video::{PlaybackPosition, Video};
@@ -216,6 +231,7 @@ mod tests {
     use crate::infrastructure::shared::domain_events::event_repository::{
         EventRepository, SqliteEventRepository,
     };
+    use crate::infrastructure::shared::show_locks::ShowLocks;
     use crate::infrastructure::shared::sqlite_connection::TestDatabase;
     use crate::infrastructure::shared::system_clock::FixedClock;
     use chrono::{DateTime, Utc};
@@ -1589,11 +1605,54 @@ mod tests {
             Arc::new(SqliteChannelRepository::new(db.database())),
             Arc::new(SqliteChannelVideoRepository::new(db.database())),
             Arc::new(SqliteVideoRepository::new(db.database())),
+            Arc::new(SqliteTaskRepository::new(
+                db.database(),
+                Arc::new(FixedClock(fixed_timestamp())),
+            )),
+            Arc::new(SqliteEventRepository::new(db.database())),
+            "/videos",
         );
 
         let response = list(channel_view_searcher).await;
 
         assert_eq!(response, Ok(vec![]));
+    }
+
+    #[tokio::test]
+    async fn it_should_list_a_channel_with_a_pending_video_as_work_in_progress() {
+        let db = TestDatabase::new();
+        let channel_repository = Arc::new(SqliteChannelRepository::new(db.database()));
+        let channel_video_repository = Arc::new(SqliteChannelVideoRepository::new(db.database()));
+        let video_repository = Arc::new(SqliteVideoRepository::new(db.database()));
+        channel_repository.insert(&channel("@somechannel")).unwrap();
+        save_channel_video(
+            video_repository.as_ref(),
+            channel_video_repository.as_ref(),
+            "@somechannel",
+            "vid_pending",
+            0,
+        );
+        let channel_view_searcher = ChannelViewSearcher::new(
+            channel_repository,
+            channel_video_repository,
+            video_repository,
+            Arc::new(SqliteTaskRepository::new(
+                db.database(),
+                Arc::new(FixedClock(fixed_timestamp())),
+            )),
+            Arc::new(SqliteEventRepository::new(db.database())),
+            "/videos",
+        );
+
+        let response = list(channel_view_searcher).await;
+
+        assert_eq!(
+            response,
+            Ok(vec![ChannelListItemResponse {
+                work_in_progress: true,
+                ..some_channel_list_item_response()
+            }])
+        );
     }
 
     #[tokio::test]
@@ -1605,6 +1664,12 @@ mod tests {
             channel_repository,
             Arc::new(SqliteChannelVideoRepository::new(db.database())),
             Arc::new(SqliteVideoRepository::new(db.database())),
+            Arc::new(SqliteTaskRepository::new(
+                db.database(),
+                Arc::new(FixedClock(fixed_timestamp())),
+            )),
+            Arc::new(SqliteEventRepository::new(db.database())),
+            "/videos",
         );
 
         let response = list(channel_view_searcher).await;
@@ -1634,6 +1699,12 @@ mod tests {
             channel_repository,
             Arc::new(SqliteChannelVideoRepository::new(db.database())),
             Arc::new(SqliteVideoRepository::new(db.database())),
+            Arc::new(SqliteTaskRepository::new(
+                db.database(),
+                Arc::new(FixedClock(fixed_timestamp())),
+            )),
+            Arc::new(SqliteEventRepository::new(db.database())),
+            "/videos",
         );
 
         let response = list(channel_view_searcher).await;
@@ -1671,6 +1742,12 @@ mod tests {
             channel_repository,
             Arc::new(SqliteChannelVideoRepository::new(db.database())),
             Arc::new(SqliteVideoRepository::new(db.database())),
+            Arc::new(SqliteTaskRepository::new(
+                db.database(),
+                Arc::new(FixedClock(fixed_timestamp())),
+            )),
+            Arc::new(SqliteEventRepository::new(db.database())),
+            "/videos",
         );
 
         let response = list(channel_view_searcher).await;
@@ -1704,6 +1781,12 @@ mod tests {
             channel_repository,
             Arc::new(SqliteChannelVideoRepository::new(db.database())),
             Arc::new(SqliteVideoRepository::new(db.database())),
+            Arc::new(SqliteTaskRepository::new(
+                db.database(),
+                Arc::new(FixedClock(fixed_timestamp())),
+            )),
+            Arc::new(SqliteEventRepository::new(db.database())),
+            "/videos",
         );
 
         let response = list(channel_view_searcher).await;
@@ -1767,6 +1850,12 @@ mod tests {
             channel_repository,
             channel_video_repository,
             video_repository,
+            Arc::new(SqliteTaskRepository::new(
+                db.database(),
+                Arc::new(FixedClock(fixed_timestamp())),
+            )),
+            Arc::new(SqliteEventRepository::new(db.database())),
+            "/videos",
         );
 
         let response = list(channel_view_searcher).await;
@@ -1775,6 +1864,7 @@ mod tests {
             response,
             Ok(vec![ChannelListItemResponse {
                 unwatched_count: 2,
+                work_in_progress: true,
                 ..some_channel_list_item_response()
             }])
         );
@@ -2142,6 +2232,125 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn it_should_move_a_channel() {
+        let db = TestDatabase::new();
+        let channel_repository = Arc::new(SqliteChannelRepository::new(db.database()));
+        let event_repository = SqliteEventRepository::new(db.database());
+        let video_file_repository =
+            Arc::new(FakeVideoFileRepository::default().with_dir("/videos/creators/somechannel"));
+        channel_repository.insert(&channel("@somechannel")).unwrap();
+        let show_mover = show_mover(&db, video_file_repository.clone());
+
+        let response = move_(
+            show_mover,
+            "@somechannel",
+            move_request("science/somechannel"),
+        )
+        .await;
+
+        assert_eq!(
+            response,
+            Ok(ChannelResponse {
+                path: "science/somechannel".to_string(),
+                ..some_channel_response()
+            })
+        );
+        assert_eq!(
+            channel_repository.list().unwrap(),
+            vec![
+                channel("@somechannel")
+                    .with_path(PlaylistPath::new("science/somechannel").unwrap())
+            ]
+        );
+        assert_eq!(
+            video_file_repository.renamed_dirs(),
+            vec![(
+                std::path::PathBuf::from("/videos/creators/somechannel"),
+                std::path::PathBuf::from("/videos/science/somechannel")
+            )]
+        );
+        assert_eq!(
+            event_repository.list_eligible().unwrap(),
+            vec![pending_event(
+                1,
+                DomainEvent::ShowMoved(ShowMoved {
+                    from: "/videos/creators/somechannel".to_string(),
+                    to: "/videos/science/somechannel".to_string(),
+                })
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn it_should_fail_to_move_a_missing_channel() {
+        let db = TestDatabase::new();
+        let event_repository = SqliteEventRepository::new(db.database());
+        let video_file_repository =
+            Arc::new(FakeVideoFileRepository::default().with_dir("/videos/creators/somechannel"));
+        let show_mover = show_mover(&db, video_file_repository.clone());
+
+        let response = move_(show_mover, "@missing", move_request("science/somechannel")).await;
+
+        assert_eq!(
+            response,
+            Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "playlist or channel not found"
+            ))
+        );
+        assert_eq!(video_file_repository.renamed_dirs(), vec![]);
+        assert_eq!(event_repository.list_eligible().unwrap(), vec![]);
+    }
+
+    #[tokio::test]
+    async fn it_should_fail_to_move_if_a_channel_video_is_pending() {
+        let db = TestDatabase::new();
+        let channel_repository = Arc::new(SqliteChannelRepository::new(db.database()));
+        let video_repository = SqliteVideoRepository::new(db.database());
+        let channel_video_repository = SqliteChannelVideoRepository::new(db.database());
+        let event_repository = SqliteEventRepository::new(db.database());
+        let video_file_repository =
+            Arc::new(FakeVideoFileRepository::default().with_dir("/videos/creators/somechannel"));
+        channel_repository.insert(&channel("@somechannel")).unwrap();
+        save_downloaded_channel_video(
+            &video_repository,
+            &channel_video_repository,
+            "@somechannel",
+            "vid_downloaded",
+            0,
+        );
+        save_channel_video(
+            &video_repository,
+            &channel_video_repository,
+            "@somechannel",
+            "vid_pending",
+            1,
+        );
+        let show_mover = show_mover(&db, video_file_repository.clone());
+
+        let response = move_(
+            show_mover,
+            "@somechannel",
+            move_request("science/somechannel"),
+        )
+        .await;
+
+        assert_eq!(
+            response,
+            Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "playlist or channel still has work in progress, try again once its downloads finish"
+            ))
+        );
+        assert_eq!(
+            channel_repository.list().unwrap(),
+            vec![channel("@somechannel")]
+        );
+        assert_eq!(video_file_repository.renamed_dirs(), vec![]);
+        assert_eq!(event_repository.list_eligible().unwrap(), vec![]);
+    }
+
     fn any_channel_creator() -> ChannelCreator {
         ChannelCreator::new(
             Arc::new(SqliteChannelRepository::new(unused_connection())),
@@ -2257,6 +2466,7 @@ mod tests {
                 Arc::new(FakeChannelAvatarRepository::default()),
             )),
             Arc::new(FixedClock(fixed_timestamp())),
+            Arc::new(ShowLocks::default()),
         )
     }
 
@@ -2324,6 +2534,7 @@ mod tests {
                 Arc::new(FakeChannelAvatarRepository::default()),
             )),
             Arc::new(FixedClock(fixed_timestamp())),
+            Arc::new(ShowLocks::default()),
         )
     }
 
@@ -2628,6 +2839,7 @@ mod tests {
             reconcile_interval_minutes: 180,
             avatar_filename: None,
             unwatched_count: 0,
+            work_in_progress: false,
         }
     }
 
@@ -2687,6 +2899,51 @@ mod tests {
             Path(channel_handle.to_string()),
         )
         .await
+    }
+
+    async fn move_(
+        show_mover: ShowMover,
+        channel_handle: &str,
+        request: MoveChannelRequest,
+    ) -> Result<ChannelResponse, ApiError> {
+        move_channel(
+            State(show_mover),
+            Path(channel_handle.to_string()),
+            Json(request),
+        )
+        .await
+        .map(|Json(channel)| channel)
+    }
+
+    /// Builds a mover on `db` (where each test seeds and asserts sources,
+    /// videos, tasks and events) under the videos root `/videos`, with its
+    /// own show locks, nobody else holds.
+    fn show_mover(
+        db: &TestDatabase,
+        video_file_repository: Arc<FakeVideoFileRepository>,
+    ) -> ShowMover {
+        ShowMover::new(
+            Arc::new(SqlitePlaylistRepository::new(db.database())),
+            Arc::new(SqliteChannelRepository::new(db.database())),
+            Arc::new(SqlitePlaylistVideoRepository::new(db.database())),
+            Arc::new(SqliteChannelVideoRepository::new(db.database())),
+            Arc::new(SqliteVideoRepository::new(db.database())),
+            Arc::new(SqliteTaskRepository::new(
+                db.database(),
+                Arc::new(FixedClock(fixed_timestamp())),
+            )),
+            Arc::new(SqliteEventRepository::new(db.database())),
+            video_file_repository,
+            event_publisher(db),
+            Arc::new(ShowLocks::default()),
+            "/videos",
+        )
+    }
+
+    fn move_request(path: &str) -> MoveChannelRequest {
+        MoveChannelRequest {
+            path: Some(path.to_string()),
+        }
     }
 
     async fn reconcile(

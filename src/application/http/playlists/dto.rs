@@ -26,6 +26,12 @@ pub struct UpdatePlaylistRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct MovePlaylistRequest {
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct PreviewPlaylistQuery {
     #[serde(default)]
     pub playlist: Option<String>,
@@ -72,6 +78,7 @@ pub struct PlaylistListItemResponse {
     pub reconcile_interval_minutes: u32,
     pub created_at: DateTime<Utc>,
     pub unwatched_count: usize,
+    pub work_in_progress: bool,
 }
 
 impl From<PlaylistView> for PlaylistListItemResponse {
@@ -87,6 +94,7 @@ impl From<PlaylistView> for PlaylistListItemResponse {
             reconcile_interval_minutes: playlist.reconcile_interval.minutes(),
             created_at: playlist.created_at,
             unwatched_count: playlist.unwatched_count,
+            work_in_progress: playlist.work_in_progress,
         }
     }
 }

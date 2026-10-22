@@ -1,9 +1,11 @@
 import { useState, type FormEvent } from 'react'
-import type { UpdatePlaylistRequest } from '@/api/client'
+import { movePlaylist, type UpdatePlaylistRequest } from '@/api/client'
 import type { PlaylistListItem } from '@/api/types'
 import { intervalForm, intervalMinutes, type IntervalForm } from '@/lib/reconcileInterval'
 import { useSourceCategoriesField } from '@/hooks/useSourceCategoriesField'
 import { CategoryPicker } from './CategoryPicker'
+import { LocationLine } from './LocationLine'
+import { MoveSourceDialog } from './MoveSourceDialog'
 import { ReconcileIntervalField } from './ReconcileIntervalField'
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
@@ -22,9 +24,31 @@ export function EditPlaylistDialog({
   onOpenChange,
   onSave,
 }: EditPlaylistDialogProps) {
+  const [moving, setMoving] = useState(false)
+  if (moving) {
+    return (
+      <MoveSourceDialog
+        kind="playlist"
+        name={playlist.name}
+        currentPath={playlist.path}
+        onMove={(path) => movePlaylist(playlist.id, path)}
+        onClose={() => {
+          setMoving(false)
+          onOpenChange(false)
+        }}
+      />
+    )
+  }
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="gap-5 p-6 sm:max-w-md">
+      {/* Focus the first setting, not the Location line's "Move…" above it. */}
+      <DialogContent
+        className="gap-5 p-6 sm:max-w-md"
+        onOpenAutoFocus={(event) => {
+          event.preventDefault()
+          document.getElementById('edit-playlist-interval')?.focus()
+        }}
+      >
         <DialogTitle>Edit {playlist.name} settings</DialogTitle>
         <DialogDescription className="sr-only">
           Change how often {playlist.name} is checked for new videos.
@@ -35,6 +59,7 @@ export function EditPlaylistDialog({
           playlist={playlist}
           onSave={onSave}
           onClose={() => onOpenChange(false)}
+          onMoveRequest={() => setMoving(true)}
         />
       </DialogContent>
     </Dialog>
@@ -45,9 +70,11 @@ interface EditPlaylistFormProps {
   playlist: PlaylistListItem
   onSave: (changes: UpdatePlaylistRequest) => Promise<void>
   onClose: () => void
+  /** Leaves the form unsaved for the move dialog. */
+  onMoveRequest: () => void
 }
 
-function EditPlaylistForm({ playlist, onSave, onClose }: EditPlaylistFormProps) {
+function EditPlaylistForm({ playlist, onSave, onClose, onMoveRequest }: EditPlaylistFormProps) {
   const [interval, changeInterval] = useState<IntervalForm>(
     intervalForm(playlist.reconcile_interval_minutes),
   )
@@ -82,6 +109,11 @@ function EditPlaylistForm({ playlist, onSave, onClose }: EditPlaylistFormProps) 
 
   return (
     <form className="flex min-w-0 flex-col gap-5" onSubmit={handleSubmit}>
+      <LocationLine
+        path={playlist.path}
+        onMove={onMoveRequest}
+        moveBlocked={playlist.work_in_progress}
+      />
       <ReconcileIntervalField id="edit-playlist-interval" value={interval} onChange={changeInterval} />
       <CategoryPicker value={categories.value} onChange={categories.onChange} />
 

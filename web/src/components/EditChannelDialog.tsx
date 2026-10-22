@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from 'react'
-import type { UpdateChannelRequest } from '@/api/client'
+import { moveChannel, type UpdateChannelRequest } from '@/api/client'
 import type { ChannelListItem } from '@/api/types'
 import {
   channelSettingsChanges,
@@ -9,6 +9,8 @@ import {
 import { intervalForm, type IntervalForm } from '@/lib/reconcileInterval'
 import { useSourceCategoriesField } from '@/hooks/useSourceCategoriesField'
 import { CategoryPicker } from './CategoryPicker'
+import { LocationLine } from './LocationLine'
+import { MoveSourceDialog } from './MoveSourceDialog'
 import { ReconcileIntervalField } from './ReconcileIntervalField'
 import { VideoQualityField } from './VideoQualityField'
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from '@/components/ui/dialog'
@@ -25,16 +27,43 @@ interface EditChannelDialogProps {
 }
 
 export function EditChannelDialog({ channel, open, onOpenChange, onSave }: EditChannelDialogProps) {
+  const [moving, setMoving] = useState(false)
+  if (moving) {
+    return (
+      <MoveSourceDialog
+        kind="channel"
+        name={channel.name}
+        currentPath={channel.path}
+        onMove={(path) => moveChannel(channel.id, path)}
+        onClose={() => {
+          setMoving(false)
+          onOpenChange(false)
+        }}
+      />
+    )
+  }
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="gap-5 p-6 sm:max-w-md">
+      {/* Focus the first setting, not the Location line's "Move…" above it. */}
+      <DialogContent
+        className="gap-5 p-6 sm:max-w-md"
+        onOpenAutoFocus={(event) => {
+          event.preventDefault()
+          document.getElementById('edit-channel-quality')?.focus()
+        }}
+      >
         <DialogTitle>Edit {channel.name} settings</DialogTitle>
         <DialogDescription className="sr-only">
           Change the video quality, video limit and check interval of {channel.name}.
         </DialogDescription>
         {/* The form unmounts with the dialog, so every open starts from the
             channel's current settings. */}
-        <EditChannelForm channel={channel} onSave={onSave} onClose={() => onOpenChange(false)} />
+        <EditChannelForm
+          channel={channel}
+          onSave={onSave}
+          onClose={() => onOpenChange(false)}
+          onMoveRequest={() => setMoving(true)}
+        />
       </DialogContent>
     </Dialog>
   )
@@ -44,9 +73,11 @@ interface EditChannelFormProps {
   channel: ChannelListItem
   onSave: (changes: UpdateChannelRequest) => Promise<void>
   onClose: () => void
+  /** Leaves the form unsaved for the move dialog. */
+  onMoveRequest: () => void
 }
 
-function EditChannelForm({ channel, onSave, onClose }: EditChannelFormProps) {
+function EditChannelForm({ channel, onSave, onClose, onMoveRequest }: EditChannelFormProps) {
   const [form, setForm] = useState<ChannelSettingsForm>({
     quality: channel.quality,
     video_limit: String(channel.video_limit),
@@ -91,6 +122,11 @@ function EditChannelForm({ channel, onSave, onClose }: EditChannelFormProps) {
 
   return (
     <form className="flex min-w-0 flex-col gap-5" onSubmit={handleSubmit}>
+      <LocationLine
+        path={channel.path}
+        onMove={onMoveRequest}
+        moveBlocked={channel.work_in_progress}
+      />
       <div className="flex flex-col gap-1.5">
         <VideoQualityField
           id="edit-channel-quality"

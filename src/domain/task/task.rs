@@ -268,6 +268,42 @@ impl Task {
         }?;
         Some(format!("video:{video_id}"))
     }
+
+    /// The show directory a per-video task (`download_video`,
+    /// `fetch_thumbnail`, `fetch_subtitles`, `delete_video_file`) writes to
+    /// or deletes from; `None` for any other task type.
+    pub fn output_dir_of(task_type: &str, payload: &str) -> Option<String> {
+        match task_type {
+            "download_video" => Self::decode_download_video_payload(payload)
+                .ok()
+                .map(|(_, _, output_dir)| output_dir),
+            "fetch_thumbnail" => Self::decode_fetch_thumbnail_payload(payload)
+                .ok()
+                .map(|(_, output_dir)| output_dir),
+            "fetch_subtitles" => Self::decode_fetch_subtitles_payload(payload)
+                .ok()
+                .map(|(_, output_dir)| output_dir),
+            "delete_video_file" => Self::decode_delete_video_file_payload(payload)
+                .ok()
+                .map(|payload| payload.output_dir),
+            _ => None,
+        }
+    }
+
+    /// The source path (relative to the videos root) a `delete_playlist_files`
+    /// or `delete_channel_files` task removes recursively; `None` for any
+    /// other task type.
+    pub fn deleted_path_of(task_type: &str, payload: &str) -> Option<String> {
+        match task_type {
+            "delete_playlist_files" => Self::decode_delete_playlist_files_payload(payload)
+                .ok()
+                .map(|(_, path)| path),
+            "delete_channel_files" => Self::decode_delete_channel_files_payload(payload)
+                .ok()
+                .map(|(_, path)| path),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -561,5 +597,104 @@ mod tests {
                 None,
             ]
         );
+    }
+
+    #[test]
+    fn it_should_read_the_output_dir_of_every_per_video_task() {
+        let tasks = [
+            Task::DownloadVideo {
+                video_id: "rec1".to_string(),
+                quality: "high".to_string(),
+                output_dir: "/videos/music".to_string(),
+            },
+            Task::FetchThumbnail {
+                video_id: "rec1".to_string(),
+                output_dir: "/videos/music".to_string(),
+            },
+            Task::FetchSubtitles {
+                video_id: "rec1".to_string(),
+                output_dir: "/videos/music".to_string(),
+            },
+            Task::DeleteVideoFile {
+                filename: Some("My Video.mp4".to_string()),
+                thumbnail_filename: None,
+                subtitle_filename: None,
+                output_dir: "/videos/music".to_string(),
+            },
+        ];
+
+        let output_dirs: Vec<Option<String>> = tasks
+            .iter()
+            .map(|task| Task::output_dir_of(task.task_type(), &task.payload().to_string()))
+            .collect();
+
+        assert_eq!(output_dirs, vec![Some("/videos/music".to_string()); 4]);
+    }
+
+    #[test]
+    fn it_should_have_no_output_dir_for_reconciles() {
+        let tasks = [
+            Task::ReconcilePlaylist {
+                playlist_id: "PL1".to_string(),
+            },
+            Task::ReconcileChannel {
+                channel_id: "@somechannel".to_string(),
+            },
+        ];
+
+        let output_dirs: Vec<Option<String>> = tasks
+            .iter()
+            .map(|task| Task::output_dir_of(task.task_type(), &task.payload().to_string()))
+            .collect();
+
+        assert_eq!(output_dirs, vec![None, None]);
+    }
+
+    #[test]
+    fn it_should_read_the_deleted_path_of_source_file_deletions() {
+        let tasks = [
+            Task::DeletePlaylistFiles {
+                playlist_id: "PL1".to_string(),
+                path: "music/chill".to_string(),
+            },
+            Task::DeleteChannelFiles {
+                channel_id: "@somechannel".to_string(),
+                path: "music/chill".to_string(),
+            },
+        ];
+
+        let deleted_paths: Vec<Option<String>> = tasks
+            .iter()
+            .map(|task| Task::deleted_path_of(task.task_type(), &task.payload().to_string()))
+            .collect();
+
+        assert_eq!(deleted_paths, vec![Some("music/chill".to_string()); 2]);
+    }
+
+    #[test]
+    fn it_should_have_no_deleted_path_for_other_tasks() {
+        let tasks = [
+            Task::ReconcilePlaylist {
+                playlist_id: "PL1".to_string(),
+            },
+            Task::DeleteVideoFile {
+                filename: Some("My Video.mp4".to_string()),
+                thumbnail_filename: None,
+                subtitle_filename: None,
+                output_dir: "/videos/music".to_string(),
+            },
+        ];
+
+        let deleted_paths: Vec<Option<String>> = tasks
+            .iter()
+            .map(|task| Task::deleted_path_of(task.task_type(), &task.payload().to_string()))
+            .collect();
+
+        assert_eq!(deleted_paths, vec![None, None]);
+    }
+
+    #[test]
+    fn it_should_have_no_deleted_path_for_an_undecodable_payload() {
+        assert_eq!(Task::deleted_path_of("delete_playlist_files", "{}"), None);
     }
 }

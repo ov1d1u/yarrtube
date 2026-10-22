@@ -118,4 +118,43 @@ describe('EditPlaylistDialog', () => {
       ['/api/categories/courses/members', { channels: ['@teacher'], playlists: ['PLend'] }],
     ])
   })
+  it('shows where the playlist is stored', () => {
+    renderDialog(aPlaylist({ name: 'Lofi beats', path: 'music/chill' }))
+
+    expect(screen.getByText('Location')).toBeInTheDocument()
+    expect(screen.getByText('music/chill')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Move…' })).toBeInTheDocument()
+  })
+
+  it('opens the move dialog without saving', async () => {
+    const { onSave } = renderDialog(aPlaylist({ name: 'Lofi beats', path: 'music/chill' }), vi.fn(async () => {}), {
+      'GET /api/categories': aCategoryList(),
+      'GET /api/playlists': [],
+      'GET /api/channels': [],
+      'GET /api/directories': { root: '/videos', path: '', entries: [] },
+    })
+    const user = userEvent.setup()
+
+    await user.click(screen.getByRole('button', { name: 'Move…' }))
+
+    expect(await screen.findByRole('dialog', { name: 'Move Lofi beats' })).toBeInTheDocument()
+    expect(screen.queryByRole('dialog', { name: 'Edit Lofi beats settings' })).not.toBeInTheDocument()
+    expect(await screen.findByRole('radio', { name: 'music/' })).toBeChecked()
+    expect(onSave).not.toHaveBeenCalled()
+  })
+
+  it('focuses its first setting, not "Move…", when opened', () => {
+    renderDialog(aPlaylist())
+
+    expect(screen.getByLabelText('Check for new videos every')).toHaveFocus()
+  })
+
+  it('disables "Move…" while the playlist has work in progress', () => {
+    renderDialog(aPlaylist({ work_in_progress: true }))
+
+    expect(screen.getByRole('button', { name: 'Move…' })).toBeDisabled()
+    expect(
+      screen.getByText('Downloads in progress — you can move it once they finish.'),
+    ).toBeInTheDocument()
+  })
 })

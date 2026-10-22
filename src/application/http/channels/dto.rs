@@ -27,6 +27,12 @@ pub struct UpdateChannelRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct MoveChannelRequest {
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct PreviewChannelQuery {
     #[serde(default)]
     pub channel: Option<String>,
@@ -71,6 +77,7 @@ pub struct ChannelListItemResponse {
     pub reconcile_interval_minutes: u32,
     pub avatar_filename: Option<String>,
     pub unwatched_count: usize,
+    pub work_in_progress: bool,
 }
 
 impl From<ChannelView> for ChannelListItemResponse {
@@ -84,6 +91,7 @@ impl From<ChannelView> for ChannelListItemResponse {
             reconcile_interval_minutes: channel.reconcile_interval.minutes(),
             avatar_filename: channel.avatar_filename,
             unwatched_count: channel.unwatched_count,
+            work_in_progress: channel.work_in_progress,
         }
     }
 }

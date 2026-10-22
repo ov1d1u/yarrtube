@@ -1,10 +1,15 @@
+use crate::domain::event::ScheduledEvent;
 use crate::domain::playlist::{Playlist, PlaylistId, PlaylistView};
-use crate::domain::playlist_video::PlaylistVideo;
-use crate::domain::video::VideoRecordId;
+use crate::domain::show::has_work_in_progress;
+use crate::domain::task::ScheduledTask;
+use crate::domain::video::{Video, VideoRecordId};
 use crate::infrastructure::repositories::sqlite_playlist_repository::PlaylistRepository;
 use crate::infrastructure::repositories::sqlite_playlist_video_repository::PlaylistVideoRepository;
+use crate::infrastructure::repositories::sqlite_task_repository::TaskRepository;
 use crate::infrastructure::repositories::sqlite_video_repository::VideoRepository;
-use std::collections::{HashMap, HashSet};
+use crate::infrastructure::shared::domain_events::event_repository::EventRepository;
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Reads playlists as `PlaylistView`s.
@@ -13,6 +18,9 @@ pub struct PlaylistViewSearcher {
     repository: Arc<dyn PlaylistRepository>,
     playlist_video_repository: Arc<dyn PlaylistVideoRepository>,
     video_repository: Arc<dyn VideoRepository>,
+    task_repository: Arc<dyn TaskRepository>,
+    event_repository: Arc<dyn EventRepository>,
+    videos_root: PathBuf,
 }
 
 impl PlaylistViewSearcher {
@@ -20,11 +28,17 @@ impl PlaylistViewSearcher {
         repository: Arc<dyn PlaylistRepository>,
         playlist_video_repository: Arc<dyn PlaylistVideoRepository>,
         video_repository: Arc<dyn VideoRepository>,
+        task_repository: Arc<dyn TaskRepository>,
+        event_repository: Arc<dyn EventRepository>,
+        videos_root: impl Into<PathBuf>,
     ) -> Self {
         Self {
             repository,
             playlist_video_repository,
             video_repository,
+            task_repository,
+            event_repository,
+            videos_root: videos_root.into(),
         }
     }
 }
@@ -36,48 +50,60 @@ pub trait PlaylistViewSearcherApi: Send + Sync {
 impl PlaylistViewSearcherApi for PlaylistViewSearcher {
     fn search_all(&self) -> anyhow::Result<Vec<PlaylistView>> {
         let playlists = self.repository.list()?;
-        let counts = self.unwatched_counts()?;
+        let videos = self.videos_by_playlist()?;
+        let tasks = self.task_repository.list_non_completed()?;
+        let events = self.event_repository.list_eligible()?;
         Ok(playlists
             .into_iter()
-            .map(|playlist| Self::playlist_view(playlist, &counts))
+            .map(|playlist| {
+                let playlist_videos = videos.get(&playlist.id).map(Vec::as_slice).unwrap_or(&[]);
+                self.playlist_view(playlist, playlist_videos, &tasks, &events)
+            })
             .collect())
     }
 }
 
 impl PlaylistViewSearcher {
-    /// Downloaded, unwatched videos per playlist. Playlists with none are absent.
-    fn unwatched_counts(&self) -> anyhow::Result<HashMap<PlaylistId, usize>> {
+    /// Every stored video, grouped by the playlist it belongs to. Playlists
+    /// with none are absent.
+    fn videos_by_playlist(&self) -> anyhow::Result<HashMap<PlaylistId, Vec<Video>>> {
         let playlist_videos = self.playlist_video_repository.list()?;
-        let unwatched = self.unwatched_video_ids(&playlist_videos)?;
-        Ok(playlist_videos
-            .into_iter()
-            .filter(|playlist_video| unwatched.contains(&playlist_video.video_id))
-            .fold(HashMap::new(), |mut counts, playlist_video| {
-                *counts.entry(playlist_video.playlist_id).or_insert(0) += 1;
-                counts
-            }))
-    }
-
-    fn unwatched_video_ids(
-        &self,
-        playlist_videos: &[PlaylistVideo],
-    ) -> anyhow::Result<HashSet<VideoRecordId>> {
         let video_ids: Vec<VideoRecordId> = playlist_videos
             .iter()
             .map(|playlist_video| playlist_video.video_id.clone())
             .collect();
-        Ok(self
+        let videos: HashMap<VideoRecordId, Video> = self
             .video_repository
             .find_many(&video_ids)?
             .into_iter()
-            .filter(|video| video.is_downloaded_and_unwatched())
-            .map(|video| video.id)
-            .collect())
+            .map(|video| (video.id.clone(), video))
+            .collect();
+        Ok(playlist_videos
+            .into_iter()
+            .filter_map(|playlist_video| {
+                let video = videos.get(&playlist_video.video_id)?.clone();
+                Some((playlist_video.playlist_id, video))
+            })
+            .fold(HashMap::new(), |mut grouped, (playlist_id, video)| {
+                grouped.entry(playlist_id).or_default().push(video);
+                grouped
+            }))
     }
 
-    fn playlist_view(playlist: Playlist, counts: &HashMap<PlaylistId, usize>) -> PlaylistView {
+    fn playlist_view(
+        &self,
+        playlist: Playlist,
+        videos: &[Video],
+        tasks: &[ScheduledTask],
+        events: &[ScheduledEvent],
+    ) -> PlaylistView {
+        let show_dir = self.videos_root.join(playlist.path.as_str());
         PlaylistView {
-            unwatched_count: counts.get(&playlist.id).copied().unwrap_or(0),
+            unwatched_count: videos
+                .iter()
+                .filter(|video| video.is_downloaded_and_unwatched())
+                .count(),
+            work_in_progress: has_work_in_progress(videos, tasks, events, &show_dir),
             id: playlist.id,
             name: playlist.name,
             path: playlist.path,

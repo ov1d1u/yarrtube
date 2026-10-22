@@ -43,6 +43,7 @@ mod tests {
     use crate::domain::services::ThumbnailFetcher;
     use crate::domain::services::VideoRelocator;
     use crate::domain::shared::{Quality, ReconcileInterval};
+    use crate::domain::show::ShowKey;
     use crate::domain::task::{ScheduledTask, TaskStatus};
     use crate::domain::video::Video;
     use crate::domain::video::{EpisodeNumber, SubtitleState, VideoId, VideoRecordId, VideoStatus};
@@ -85,6 +86,7 @@ mod tests {
     use crate::infrastructure::shared::domain_events::event_repository::{
         EventRepository, SqliteEventRepository,
     };
+    use crate::infrastructure::shared::show_locks::ShowLocks;
     use crate::infrastructure::shared::sqlite_connection::TestDatabase;
     use crate::infrastructure::shared::system_clock::FixedClock;
     use crate::infrastructure::shared::ytdlp::FetchedThumbnail;
@@ -402,6 +404,7 @@ mod tests {
                 Arc::new(FakeChannelAvatarRepository::default()),
             )),
             Arc::new(FixedClock(fixed_timestamp())),
+            Arc::new(ShowLocks::default()),
         ));
 
         let result = run(&task, &payload_for("@somechannel"));
@@ -873,6 +876,7 @@ mod tests {
                 Arc::new(FakeChannelAvatarRepository::default()),
             )),
             Arc::new(FixedClock(fixed_timestamp())),
+            Arc::new(ShowLocks::default()),
         ));
 
         let result = run(&task, &payload_for("@somechannel"));
@@ -895,6 +899,112 @@ mod tests {
             vec![(
                 PathBuf::from("/videos/creators/somechannel"),
                 PathBuf::from("avatars/@somechannel.jpg")
+            )]
+        );
+    }
+
+    #[test]
+    fn it_should_wait_for_a_move_before_reconciling() {
+        let db = TestDatabase::new();
+        let channel_repository = Arc::new(SqliteChannelRepository::new(db.database()));
+        let video_repository = Arc::new(SqliteVideoRepository::new(db.database()));
+        let task_repository = Arc::new(SqliteTaskRepository::new(
+            db.database(),
+            Arc::new(FixedClock(fixed_timestamp())),
+        ));
+        let show_file_repository = Arc::new(FakeShowFileRepository::default());
+        let show_locks = Arc::new(ShowLocks::default());
+        channel_repository.insert(&channel("@somechannel")).unwrap();
+        let task = ReconcileChannelTask::new(ChannelVideoReconciler::new(
+            channel_repository.clone(),
+            video_repository.clone(),
+            Arc::new(SqliteVideoTranscriptRepository::new(db.database())),
+            Arc::new(SqliteChannelVideoRepository::new(db.database())),
+            Arc::new(FakeChannelVideosRepository::with_videos(Vec::new())),
+            Arc::new(SqliteEventPublisher::new(
+                db.database(),
+                Arc::new(FixedClock(fixed_timestamp())),
+            )),
+            task_repository.clone(),
+            Arc::new(InternalVideoReconciler::new(
+                video_repository.clone(),
+                Arc::new(MetadataGenerator::new(
+                    Arc::new(FakeYoutubeMetadataRepository::default()),
+                    Arc::new(FixedClock(fixed_timestamp())),
+                )),
+                Arc::new(SqliteVideoMetadataRepository::new(db.database())),
+                task_repository.clone(),
+                Arc::new(FakeVideoFileRepository::default()),
+                Arc::new(SubtitleFetcher::new(
+                    video_repository.clone(),
+                    Arc::new(SqliteVideoTranscriptRepository::new(db.database())),
+                    Arc::new(FakeVideoDownloaderRepository::default()),
+                    Arc::new(FakeVideoFileRepository::default()),
+                    task_repository.clone(),
+                    Arc::new(SqliteEventPublisher::new(
+                        db.database(),
+                        Arc::new(FixedClock(fixed_timestamp())),
+                    )),
+                    Arc::new(FixedClock(fixed_timestamp())),
+                    "/videos",
+                )),
+                Arc::new(ThumbnailFetcher::new(
+                    video_repository.clone(),
+                    Arc::new(FakeVideoDownloaderRepository::default()),
+                    Arc::new(FakeVideoFileRepository::default()),
+                    task_repository.clone(),
+                    Arc::new(FixedClock(fixed_timestamp())),
+                    "/videos",
+                )),
+                Arc::new(VideoRelocator::new(
+                    video_repository.clone(),
+                    Arc::new(FakeVideoFileRepository::default()),
+                    Arc::new(SqliteVideoMetadataRepository::new(db.database())),
+                    Arc::new(FixedClock(fixed_timestamp())),
+                )),
+                Arc::new(FixedClock(fixed_timestamp())),
+                "/videos",
+            )),
+            Arc::new(ShowFileWriter::new(
+                show_file_repository.clone(),
+                Arc::new(FakeChannelAvatarRepository::default()),
+                "/videos",
+            )),
+            Arc::new(ChannelAvatarRestorer::new(
+                channel_repository.clone(),
+                Arc::new(FakeYoutubeChannelRepository { resolved: None }),
+                Arc::new(FakeChannelAvatarRepository::default()),
+            )),
+            Arc::new(FixedClock(fixed_timestamp())),
+            show_locks.clone(),
+        ));
+
+        let result = std::thread::scope(|scope| {
+            let moving = show_locks.lock(ShowKey::Channel(handle("@somechannel")));
+            let reconciling = scope.spawn(|| run(&task, &payload_for("@somechannel")));
+            // Gives a reconcile that doesn't wait every chance to run first.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            channel_repository
+                .update(
+                    &channel("@somechannel")
+                        .with_path(PlaylistPath::new("science/somechannel").unwrap()),
+                )
+                .unwrap();
+            drop(moving);
+            reconciling.join().unwrap()
+        });
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            *show_file_repository.show_nfos.lock().unwrap(),
+            vec![(
+                PathBuf::from("/videos/science/somechannel"),
+                concat!(
+                    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+                    "<tvshow><title>Some Channel</title><studio>Some Channel</studio>",
+                    r#"<uniqueid type="youtube">UC123</uniqueid><status>Continuing</status></tvshow>"#,
+                )
+                .to_string()
             )]
         );
     }
@@ -978,6 +1088,7 @@ mod tests {
                 avatar_repository.clone(),
             )),
             Arc::new(FixedClock(fixed_timestamp())),
+            Arc::new(ShowLocks::default()),
         ));
 
         let result = run(&task, &payload_for("@somechannel"));
@@ -1082,6 +1193,7 @@ mod tests {
                 avatar_repository.clone(),
             )),
             Arc::new(FixedClock(fixed_timestamp())),
+            Arc::new(ShowLocks::default()),
         ));
 
         let result = run(&task, &payload_for("@somechannel"));
@@ -1179,6 +1291,7 @@ mod tests {
                 avatar_repository.clone(),
             )),
             Arc::new(FixedClock(fixed_timestamp())),
+            Arc::new(ShowLocks::default()),
         ));
 
         let result = run(&task, &payload_for("@somechannel"));
@@ -1287,6 +1400,7 @@ mod tests {
                 avatar_repository.clone(),
             )),
             Arc::new(FixedClock(fixed_timestamp())),
+            Arc::new(ShowLocks::default()),
         ));
 
         let result = run(&task, &payload_for("@somechannel"));
@@ -1395,6 +1509,7 @@ mod tests {
                 avatar_repository.clone(),
             )),
             Arc::new(FixedClock(fixed_timestamp())),
+            Arc::new(ShowLocks::default()),
         ));
 
         let result = run(&task, &payload_for("@somechannel"));
@@ -1516,6 +1631,7 @@ mod tests {
                 Arc::new(FakeChannelAvatarRepository::default()),
             )),
             Arc::new(FixedClock(fixed_timestamp())),
+            Arc::new(ShowLocks::default()),
         ));
 
         let result = run(&task, &payload_for("@somechannel"));
@@ -2273,6 +2389,7 @@ mod tests {
                 Arc::new(FakeChannelAvatarRepository::default()),
             )),
             Arc::new(FixedClock(fixed_timestamp())),
+            Arc::new(ShowLocks::default()),
         ));
 
         let result = run(&task, &payload_for("@somechannel"));
@@ -2402,6 +2519,7 @@ mod tests {
                 Arc::new(FakeChannelAvatarRepository::default()),
             )),
             Arc::new(FixedClock(fixed_timestamp())),
+            Arc::new(ShowLocks::default()),
         ));
 
         let result = run(&task, &payload_for("@somechannel"));
@@ -2496,6 +2614,7 @@ mod tests {
                 Arc::new(FakeChannelAvatarRepository::default()),
             )),
             Arc::new(FixedClock(fixed_timestamp())),
+            Arc::new(ShowLocks::default()),
         ));
 
         let result = run(&task, &payload_for("@somechannel"));
@@ -2649,6 +2768,7 @@ mod tests {
                 Arc::new(FakeChannelAvatarRepository::default()),
             )),
             Arc::new(FixedClock(fixed_timestamp())),
+            Arc::new(ShowLocks::default()),
         )
     }
 
@@ -2723,6 +2843,7 @@ mod tests {
                 Arc::new(FakeChannelAvatarRepository::default()),
             )),
             Arc::new(FixedClock(fixed_timestamp())),
+            Arc::new(ShowLocks::default()),
         ))
     }
 

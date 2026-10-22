@@ -33,11 +33,22 @@ import type {
   Task,
   Video,
 } from './types'
+import { anyWorkInProgress } from '@/lib/libraryPolling'
 
 // The sidebar lists change rarely and are refetched right after the user's
 // own actions; views showing live download progress poll quickly.
 const LIBRARY_INTERVAL_MS = 60_000
 const LIVE_INTERVAL_MS = 3_000
+// Slower than the live views: each list reads every video and queued task.
+const BUSY_SOURCES_INTERVAL_MS = 5_000
+
+/**
+ * The channel and playlist lists poll faster while a source has work in
+ * progress, so its "Move…" enables within seconds of it settling.
+ */
+function sourcesInterval(items: { work_in_progress: boolean }[] | undefined): number {
+  return anyWorkInProgress(items) ? BUSY_SOURCES_INTERVAL_MS : LIBRARY_INTERVAL_MS
+}
 
 export const queryKeys = {
   channels: ['channels'] as const,
@@ -60,7 +71,7 @@ export function useChannels(): UseQueryResult<ChannelListItem[], Error> {
   return useQuery({
     queryKey: queryKeys.channels,
     queryFn: fetchChannels,
-    refetchInterval: LIBRARY_INTERVAL_MS,
+    refetchInterval: (query) => sourcesInterval(query.state.data),
   })
 }
 
@@ -68,7 +79,7 @@ export function usePlaylists(): UseQueryResult<PlaylistListItem[], Error> {
   return useQuery({
     queryKey: queryKeys.playlists,
     queryFn: fetchPlaylists,
-    refetchInterval: LIBRARY_INTERVAL_MS,
+    refetchInterval: (query) => sourcesInterval(query.state.data),
   })
 }
 
