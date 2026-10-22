@@ -552,6 +552,18 @@ pub struct ChannelVideoEntry {
 struct FlatPlaylistEntry {
     id: String,
     title: String,
+    live_status: Option<String>,
+}
+
+impl FlatPlaylistEntry {
+    /// False for an upcoming premiere or stream, one that is live now, or one
+    /// that ended but isn't processed yet: none of them can be downloaded.
+    fn is_watchable(&self) -> bool {
+        !matches!(
+            self.live_status.as_deref(),
+            Some("is_upcoming" | "is_live" | "post_live")
+        )
+    }
 }
 
 /// Lists a channel's `limit` most recent uploads via
@@ -595,18 +607,22 @@ pub fn list_channel_videos(
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout
+    let entries = stdout
         .lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| {
-            let parsed: FlatPlaylistEntry = serde_json::from_str(line)
-                .map_err(|e| anyhow!("failed to parse yt-dlp channel video listing line: {e}"))?;
-            Ok(ChannelVideoEntry {
-                video_id: parsed.id,
-                title: parsed.title,
-            })
+            serde_json::from_str::<FlatPlaylistEntry>(line)
+                .map_err(|e| anyhow!("failed to parse yt-dlp channel video listing line: {e}"))
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    Ok(entries
+        .into_iter()
+        .filter(FlatPlaylistEntry::is_watchable)
+        .map(|entry| ChannelVideoEntry {
+            video_id: entry.id,
+            title: entry.title,
+        })
+        .collect())
 }
 
 /// The outcome of running a fully-configured `yt-dlp` invocation:
@@ -2254,6 +2270,88 @@ mod tests {
         assert_eq!(
             videos,
             vec![
+                ChannelVideoEntry {
+                    video_id: "vid1".to_string(),
+                    title: "One".to_string()
+                },
+                ChannelVideoEntry {
+                    video_id: "vid2".to_string(),
+                    title: "Two".to_string()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn it_should_skip_upcoming_entries_when_listing_channel_videos() {
+        let stdout = "{\"id\": \"premiere\", \"title\": \"Soon\", \"live_status\": \"is_upcoming\"}\n{\"id\": \"vid1\", \"title\": \"One\", \"live_status\": null}\n{\"id\": \"vid2\", \"title\": \"Two\"}\n";
+        let fake = test_support::FakeYtDlp::with_stdout(stdout);
+
+        let videos = list_channel_videos(
+            &fake.path,
+            "https://www.youtube.com/@somechannel/videos",
+            10,
+        )
+        .unwrap();
+
+        assert_eq!(
+            videos,
+            vec![
+                ChannelVideoEntry {
+                    video_id: "vid1".to_string(),
+                    title: "One".to_string()
+                },
+                ChannelVideoEntry {
+                    video_id: "vid2".to_string(),
+                    title: "Two".to_string()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn it_should_skip_live_and_post_live_entries_when_listing_channel_videos() {
+        let stdout = "{\"id\": \"live\", \"title\": \"Live now\", \"live_status\": \"is_live\"}\n{\"id\": \"processing\", \"title\": \"Just ended\", \"live_status\": \"post_live\"}\n{\"id\": \"vid1\", \"title\": \"One\"}\n";
+        let fake = test_support::FakeYtDlp::with_stdout(stdout);
+
+        let videos = list_channel_videos(
+            &fake.path,
+            "https://www.youtube.com/@somechannel/videos",
+            10,
+        )
+        .unwrap();
+
+        assert_eq!(
+            videos,
+            vec![ChannelVideoEntry {
+                video_id: "vid1".to_string(),
+                title: "One".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn it_should_keep_entries_with_a_finished_or_absent_live_status() {
+        let stdout = "{\"id\": \"vod\", \"title\": \"Past stream\", \"live_status\": \"was_live\"}\n{\"id\": \"vid1\", \"title\": \"One\", \"live_status\": \"not_live\"}\n{\"id\": \"vid2\", \"title\": \"Two\"}\n";
+        let fake = test_support::FakeYtDlp::with_stdout(stdout);
+
+        let videos = list_channel_videos(
+            &fake.path,
+            "https://www.youtube.com/@somechannel/videos",
+            10,
+        )
+        .unwrap();
+
+        assert_eq!(
+            videos,
+            vec![
+                ChannelVideoEntry {
+                    video_id: "vod".to_string(),
+                    title: "Past stream".to_string()
+                },
                 ChannelVideoEntry {
                     video_id: "vid1".to_string(),
                     title: "One".to_string()
