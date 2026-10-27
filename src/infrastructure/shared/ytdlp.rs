@@ -28,10 +28,19 @@ fn output_retrying_busy(cmd: &mut Command) -> io::Result<std::process::Output> {
     }
 }
 
+/// YouTube player clients that still tend to serve downloadable adaptive
+/// formats. Shared by download and the diagnostic probe so both prefer the
+/// same sources (see `fix-high-quality-sabr-fallback`).
+const YOUTUBE_ADAPTIVE_PLAYER_CLIENTS: &str = "youtube:player_client=android,tv,ios,web_safari";
+
 /// Maps a playlist's `quality` tier to the `yt-dlp` args that select its
 /// resolution cap while softly preferring mp4/h264/aac (falling back to the
 /// best available stream instead of hard-failing when no such stream
 /// exists) — see design.md's "yt-dlp selector shape per tier" decision.
+///
+/// High/Mid raise the progressive (`/b`) floor so a SABR session cannot
+/// "succeed" as YouTube's 360p progressive format 18; Low still allows
+/// progressive at or below 480p.
 ///
 /// `--merge-output-format mp4` only takes effect when yt-dlp actually merges
 /// separate video/audio streams; when the `b` fallback in the selector picks
@@ -43,8 +52,8 @@ fn output_retrying_busy(cmd: &mut Command) -> io::Result<std::process::Output> {
 /// happened, so every download consistently lands as `.mp4`.
 pub fn args_for_quality(quality: Quality) -> Vec<String> {
     let format = match quality {
-        Quality::High => "bv*+ba/b".to_string(),
-        Quality::Mid => "bv*[height<=720]+ba/b[height<=720]".to_string(),
+        Quality::High => "bv*+ba/b[height>=720]".to_string(),
+        Quality::Mid => "bv*[height<=720]+ba/b[height<=720][height>=480]".to_string(),
         Quality::Low => "bv*[height<=480]+ba/b[height<=480]".to_string(),
     };
     vec![
@@ -136,6 +145,10 @@ pub fn download_video(
         "--write-thumbnail".to_string(),
         "--convert-thumbnails".to_string(),
         "jpg".to_string(),
+        // Prefer clients that still serve adaptive HTTPS formats so High/Mid
+        // do not collapse to progressive format 18 under a web SABR session.
+        "--extractor-args".to_string(),
+        YOUTUBE_ADAPTIVE_PLAYER_CLIENTS.to_string(),
         // Note: unlike the thumbnail/diagnose/listing invocations, this one
         // deliberately keeps warnings on (no `--no-warnings`) so `yt-dlp`'s
         // SABR-only streaming warning reaches our captured stderr, where
@@ -483,7 +496,7 @@ pub fn diagnose(ytdlp_path: &Path, video_url: &str) -> Result<Option<String>> {
         "--simulate",
         "--no-warnings",
         "--extractor-args",
-        "youtube:player_client=android,tv,ios,web_safari",
+        YOUTUBE_ADAPTIVE_PLAYER_CLIENTS,
     ])
     .arg(video_url)
     .stdout(Stdio::piped())
@@ -2196,7 +2209,7 @@ mod tests {
             args_for_quality(Quality::High),
             vec![
                 "-f".to_string(),
-                "bv*+ba/b".to_string(),
+                "bv*+ba/b[height>=720]".to_string(),
                 "-S".to_string(),
                 "codec:h264:aac,ext:mp4:m4a".to_string(),
                 "--merge-output-format".to_string(),
@@ -2213,7 +2226,7 @@ mod tests {
             args_for_quality(Quality::Mid),
             vec![
                 "-f".to_string(),
-                "bv*[height<=720]+ba/b[height<=720]".to_string(),
+                "bv*[height<=720]+ba/b[height<=720][height>=480]".to_string(),
                 "-S".to_string(),
                 "codec:h264:aac,ext:mp4:m4a".to_string(),
                 "--merge-output-format".to_string(),
@@ -2239,6 +2252,31 @@ mod tests {
                 "mp4".to_string(),
             ]
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn it_should_pass_adaptive_capable_player_clients_on_download() {
+        use test_support::{FakeYtDlp, unique_temp_dir};
+
+        let output_dir = unique_temp_dir("ytdlp-output-player-clients");
+        let fake = FakeYtDlp::with_exit_code(0);
+
+        download_video(
+            &fake.path,
+            "https://example.com/video",
+            Quality::High,
+            &output_dir,
+        )
+        .unwrap();
+
+        assert!(fake.captured_args().windows(2).any(|pair| {
+            pair == [
+                "--extractor-args",
+                "youtube:player_client=android,tv,ios,web_safari",
+            ]
+        }));
+        std::fs::remove_dir_all(&output_dir).unwrap();
     }
 
     #[test]
